@@ -22,7 +22,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "asyncssh", "portalocker"])
     import asyncssh, portalocker
 
-import os, json, asyncio, secrets, string, random, getpass, logging, sys, time
+import os, json, asyncio, secrets, string, random, getpass
 
 # ----------------------------
 # Config
@@ -38,12 +38,6 @@ SSH_RETRIES = 3
 BACKOFF_BASE = 0.5
 BACKOFF_FACTOR = 2.0
 BACKOFF_JITTER = 0.2
-
-# ----------------------------
-# Logging
-# ----------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-logger = logging.getLogger("user_mgmt")
 
 # ----------------------------
 # Helpers
@@ -85,7 +79,7 @@ def get_content_type_token(version_map, fw_version):
     return token
 
 # ----------------------------
-# Curl command wrappers (unchanged)
+# Curl command wrappers
 # ----------------------------
 async def run_cmd(cmd):
     proc = await asyncio.create_subprocess_exec(*cmd,
@@ -145,124 +139,50 @@ async def curl_get_users(base_url, sid, ct, insecure):
     return out
 
 # ----------------------------
-# LunaSH check: use SSH to run "webserver show"
+# LunaSH (SSH) functions
 # ----------------------------
-async def lunash_check_webserver(hsm, ssh_user, ssh_pass, timeout=8):
-    """
-    Connect via SSH (password) and run 'webserver show'.
-    Return True if output indicates 'running' for REST API service.
-    """
-    host = hsm.get("ipAddress") or hsm.get("host")
-    port = int(hsm.get("port", 22))
-    try:
-        async with asyncssh.connect(host, port=port, username=ssh_user, password=ssh_pass, known_hosts=None) as conn:
-            try:
-                res = await conn.run("webserver show", check=True, timeout=timeout)
-                out = res.stdout.lower()
-            except Exception:
-                # fallback to PTY if run() doesn't return expected output
-                proc = await conn.create_process(term_type='vt100')
-                proc.stdin.write("webserver show\n")
-                await proc.stdin.drain()
-                await asyncio.sleep(0.3)
-                try:
-                    out = (await proc.stdout.read(8192)).lower()
-                except Exception:
-                    out = ""
-            # look for "status: running" or at least "running" in output
-            if "running" in out:
-                return True
-            # some outputs print "Status: running" with different spacing/case
-            if "status" in out and "running" in out:
-                return True
-            return False
-    except Exception as e:
-        logger.warning("lunash_check_webserver failed to connect: %s", e)
-        return False
-
-# ----------------------------
-# LunaSH (SSH) with password + PTY fallback (for role/user ops)
-# ----------------------------
-async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd, timeout=10):
+async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
     host = hsm.get("ipAddress") or hsm.get("host")
     port = int(hsm.get("port", 22))
     local_role = os.path.join(ROLES_DIR, role_file)
     role_name = os.path.splitext(os.path.basename(local_role))[0]
     remote_role = f"/tmp/{os.path.basename(local_role)}"
 
-    diagnostics = []
-
     try:
-        async with asyncssh.connect(host, port=port, username=ssh_user,
-                                    password=ssh_pass, known_hosts=None) as conn:
-            # --- Try non-PTY path first ---
-            try:
-                async with conn.start_sftp_client() as sftp:
-                    await sftp.put(local_role, remote_role)
-
-                for cmd in (
-                    f"user role import {role_name} {remote_role}",
-                    f"user add {user} -password {pwd}",
-                    f"user role add {user} {role_name}",
-                ):
-                    logger.debug("Running non-pty command: %s", cmd)
-                    res = await conn.run(cmd, check=True, timeout=timeout)
-                    if res.exit_status != 0:
-                        raise RuntimeError(f"{cmd} failed: {res.stderr}")
-
-                await conn.run(f"user password {user}",
-                               input=(pwd + "\n" + pwd + "\n"),
-                               timeout=timeout)
-
-                out = (await conn.run("user list", check=True)).stdout
-                return user in out
-
-            except Exception as e_nonpty:
-                diagnostics.append(f"non-pty failed: {e_nonpty}")
-                logger.info("Non-PTY attempt failed, trying PTY fallback for %s", host)
-                # --- PTY fallback ---
-                proc = await conn.create_process(term_type='vt100')
-
-                async def pty_cmd(cmd, wait=0.3):
-                    proc.stdin.write(cmd + "\n")
-                    await proc.stdin.drain()
-                    await asyncio.sleep(wait)
-                    try:
-                        return await proc.stdout.read(8192)
-                    except Exception:
-                        return ""
-
-                # Upload role file again (try)
-                try:
-                    async with conn.start_sftp_client() as sftp:
-                        await sftp.put(local_role, remote_role)
-                except Exception as sftp_e:
-                    diagnostics.append(f"SFTP in PTY fallback failed: {sftp_e}")
-
-                for cmd in (
-                    f"user role import {role_name} {remote_role}",
-                    f"user add {user} -password {pwd}",
-                    f"user role add {user} {role_name}",
-                ):
-                    out = await pty_cmd(cmd, wait=0.4)
-                    diagnostics.append(f"{cmd} -> {out.strip()}")
-
-                # Handle password change (interactive)
-                proc.stdin.write(f"user password {user}\n")
-                await proc.stdin.drain()
-                await asyncio.sleep(0.2)
-                proc.stdin.write(pwd + "\n")
-                await proc.stdin.drain()
-                await asyncio.sleep(0.2)
-                proc.stdin.write(pwd + "\n")
-                await proc.stdin.drain()
-                await asyncio.sleep(0.5)
-
-                out = await pty_cmd("user list", wait=0.4)
-                return user in out
-
+        async with asyncssh.connect(
+            host, port=port,
+            username=ssh_user,
+            password=ssh_pass,
+            known_hosts=None,
+            kbd_interactive_auth=True   # <-- FIXED HERE
+        ) as conn:
+            async with conn.start_sftp_client() as sftp:
+                await sftp.put(local_role, remote_role)
+            await conn.run(f"user role import {role_name} {remote_role}")
+            await conn.run(f"user add {user} -password {pwd}")
+            await conn.run(f"user role add {user} {role_name}")
+            await conn.run(f"user password {user}", input=(pwd + "\n" + pwd + "\n"))
+            out = (await conn.run("user list")).stdout
+            return user in out
     except Exception as e:
-        raise RuntimeError(f"LunaSH error on {host}: {e} | details: {diagnostics}")
+        raise RuntimeError(f"LunaSH error: {e}")
+
+async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
+    """Run 'webserver show' over SSH instead of curl to check status."""
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+    try:
+        async with asyncssh.connect(
+            host, port=port,
+            username=ssh_user,
+            password=ssh_pass,
+            known_hosts=None,
+            kbd_interactive_auth=True   # <-- FIXED HERE TOO
+        ) as conn:
+            res = await conn.run("webserver show", check=False)
+            return "running" in res.stdout.lower()
+    except Exception:
+        return False
 
 # ----------------------------
 # Orchestration per HSM
@@ -275,52 +195,46 @@ async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insec
     try:
         token = get_content_type_token(version_map, fw)
     except KeyError as e:
-        logger.error("[%s] Version map error: %s", hid, e)
+        print(f"[{hid}] Version map error: {e}")
         write_failed({"hsm_id": hid, "stage": "version-map", "error": str(e)})
         return {"hsm": hid, "status": "FAILED"}
 
     ct_json = f"application/vnd.safenetinc.lunasa+json;version={token}"
     ct_file = f"application/vnd.safenetinc.lunasa+file;version={token}"
-    logger.info("[%s | %s] fw=%s -> REST v%s", hid, host, fw, token)
+    print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
 
     user, pwd = gen_username(), gen_password()
     base = hsm.get("rest_url") or f"https://{host}:8443"
 
-    # LunaSH if old firmware or to check webserver
-    # We'll always verify webserver via SSH (so no curl HEAD false failures)
-    ssh_user = admin_user
-    ssh_ok = False
-    for attempt in range(1, SSH_RETRIES + 1):
-        try:
-            if await lunash_check_webserver(hsm, ssh_user, admin_pass):
-                ssh_ok = True
-                break
-            else:
-                raise RuntimeError("webserver not reported running via LunaSH")
-        except Exception as e:
-            logger.warning("[%s] webserver check attempt %d failed: %s", hid, attempt, e)
-            if attempt < SSH_RETRIES:
-                await backoff_sleep(attempt)
-    if not ssh_ok:
-        write_failed({"hsm_id": hid, "stage": "webserver", "error": "Webserver not running (LunaSH check failed)"})
+    # Webserver check via LunaSH
+    ok = False
+    for attempt in range(1, SSH_RETRIES+1):
+        if await lunash_check_webserver(hsm, admin_user, admin_pass):
+            ok = True
+            break
+        await backoff_sleep(attempt)
+    if not ok:
+        print(f"[{hid}] Webserver check failed (via LunaSH)")
+        write_failed({"hsm_id": hid, "stage": "webserver", "error": "Webserver not running (LunaSH)"})
         return {"hsm": hid, "status": "FAILED"}
 
-    # If firmware is old, perform LunaSH role/user operations
+    # LunaSH if old firmware
     if not check_fw_version(fw):
+        ssh_user = admin_user
         ok = False
         for attempt in range(1, SSH_RETRIES+1):
             try:
                 await lunash_setup(hsm, ssh_user, admin_pass, role_file, user, pwd)
                 ok = True; break
             except Exception as e:
-                logger.warning("[%s] SSH role/user attempt %d failed: %s", hid, attempt, e)
+                print(f"[{hid}] SSH attempt {attempt} failed: {e}")
                 if attempt < SSH_RETRIES:
                     await backoff_sleep(attempt)
         if not ok:
-            write_failed({"hsm_id": hid, "stage": "lunash", "error": "SSH role/user operations failed"})
+            write_failed({"hsm_id": hid, "stage": "lunash", "error": "SSH failed"})
             return {"hsm": hid, "status": "FAILED"}
 
-    # REST flow (for fw >= 7.8; but we already confirmed webserver is running)
+    # REST flow
     try:
         sid = await curl_auth(base, admin_user, admin_pass, ct_json, insecure)
         rc = await curl_post_role(base, sid, ct_json, os.path.splitext(role_file)[0], insecure)
@@ -333,10 +247,10 @@ async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insec
         if rc not in (200,201,204):
             raise RuntimeError(f"User create failed (HTTP {rc})")
         out = await curl_get_users(base, sid, ct_json, insecure)
-        if user not in out:
+        if user not in out: 
             return {"hsm": hid, "status": "WARN", "user": user, "password": pwd}
     except Exception as e:
-        logger.error("[%s] REST error: %s", hid, e)
+        print(f"[{hid}] REST error: {e}")
         write_failed({"hsm_id": hid, "stage": "rest", "error": str(e)})
         return {"hsm": hid, "status": "FAILED"}
 
@@ -386,12 +300,7 @@ def main():
         return
 
     # Normal execution
-    try:
-        results = asyncio.run(run_all(args.hsm_ids, args.admin_user, admin_pass, args.role_file, args.insecure))
-    except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
-        sys.exit(1)
-
+    results = asyncio.run(run_all(args.hsm_ids, args.admin_user, admin_pass, args.role_file, args.insecure))
     print("\nRESULTS:")
     for r in results:
         if r["status"] == "OK":

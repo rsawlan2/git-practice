@@ -154,7 +154,7 @@ async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
             username=ssh_user,
             password=ssh_pass,
             known_hosts=None,
-            kbd_interactive_auth=True   # <-- FIXED HERE
+            kbd_interactive_auth=True
         ) as conn:
             async with conn.start_sftp_client() as sftp:
                 await sftp.put(local_role, remote_role)
@@ -177,10 +177,14 @@ async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
             username=ssh_user,
             password=ssh_pass,
             known_hosts=None,
-            kbd_interactive_auth=True   # <-- FIXED HERE TOO
+            kbd_interactive_auth=True
         ) as conn:
             res = await conn.run("webserver show", check=False)
-            return "running" in res.stdout.lower()
+            out = res.stdout.lower()
+            # debug print to surface the exact output in your console
+            print(f"[DEBUG] webserver show output:\n{res.stdout}")
+            # check the two important lines that indicate the REST service is running
+            return ("configuration: enabled" in out) and ("status: running" in out)
     except Exception:
         return False
 
@@ -247,7 +251,7 @@ async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insec
         if rc not in (200,201,204):
             raise RuntimeError(f"User create failed (HTTP {rc})")
         out = await curl_get_users(base, sid, ct_json, insecure)
-        if user not in out: 
+        if user not in out:
             return {"hsm": hid, "status": "WARN", "user": user, "password": pwd}
     except Exception as e:
         print(f"[{hid}] REST error: {e}")

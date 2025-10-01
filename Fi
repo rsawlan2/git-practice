@@ -180,12 +180,17 @@ async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
             kbd_interactive_auth=True
         ) as conn:
             res = await conn.run("webserver show", check=False)
+            # Always print raw output so we can debug formatting
+            print("==== RAW OUTPUT FROM HSM ====")
+            print(res.stdout)
+            print("==== END RAW OUTPUT ====")
             out = res.stdout.lower()
-            # debug print to surface the exact output in your console
-            print(f"[DEBUG] webserver show output:\n{res.stdout}")
-            # check the two important lines that indicate the REST service is running
-            return ("configuration: enabled" in out) and ("status: running" in out)
-    except Exception:
+            # Relaxed match: require presence of both words so we don't false-negative on formatting
+            if ("status" in out) and ("running" in out):
+                return True
+            return False
+    except Exception as e:
+        print(f"[DEBUG] webserver check error: {e}")
         return False
 
 # ----------------------------

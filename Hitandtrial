@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+user_mgmt.py
+
+Automates creation of a user-management role + user on Luna HSMs.
+
+Flags:
+  --dry-run       : Show what would happen, but do nothing
+  --test-ssh      : Test SSH login only (runs 'user list'), then exit
+  --skip-webserver: Skip webserver (REST/SSH) check and go straight to LunaSH ops
+  --ssh-user      : (optional) username to use for SSH (if different from --admin-user)
+"""
+
+# --- Dependency bootstrap ---
+try:
+    import asyncssh, portalocker
+except Exception:
+    import subprocess, sys
+    print("[INFO] Installing required dependencies (asyncssh, portalocker)...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "asyncssh", "portalocker"])
+    import asyncssh, portalocker
+
+import os, json, asyncio, secrets, string, random, getpass
+
+# ----------------------------
+# Config
+# ----------------------------
+RES_DIR = "resources"
+HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+VERSION_FILE = os.path.join(RES_DIR, "version_map.json")
+ROLES_DIR = os.path.join(RES_DIR, "roles")
+FAILED_LOG = os.path.join(RES_DIR, "failed_jobs.jsonl")
+DEFAULT_ROLE_FILE = "user_mgmt_role.txt"
+
+SSH_RETRIES = 3
+BACKOFF_BASE = 0.5
+BACKOFF_FACTOR = 2.0
+BACKOFF_JITTER = 0.2
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def check_fw_version(v, cmp_to="7.8.0"):
+    def parse(s): return tuple(int(x) for x in s.split("."))
+    return parse(v) >= parse(cmp_to)
+
+def gen_username():
+    return "usermgmt_" + secrets.token_hex(3)
+
+def gen_password(length=16):
+    chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    while True:
+        p = ''.join(secrets.choice(chars) for _ in range(length))
+        if (any(c.islower() for c in p) and any(c.isupper() for c in p)
+                and any(c.isdigit() for c in p) and any(c in "!@#$%^&*()-_=+" for c in p)):
+            return p
+
+async def backoff_sleep(attempt):
+    base = BACKOFF_BASE * (BACKOFF_FACTOR ** (attempt - 1))
+    jitter = random.uniform(-BACKOFF_JITTER, BACKOFF_JITTER)
+    await asyncio.sleep(max(0, base + jitter))
+
+def write_failed(entry):
+    os.makedirs(os.path.dirname(FAILED_LOG), exist_ok=True)
+    with portalocker.Lock(FAILED_LOG, mode="a", timeout=5) as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+def get_content_type_token(version_map, fw_version):
+    token = version_map.get(fw_version)
+    if token is None:
+        raise KeyError(f"Firmware version '{fw_version}' not found in {VERSION_FILE}")
+    return token
+
+# ----------------------------
+# shell helpers
+# ----------------------------
+async def run_cmd(cmd, timeout=30):
+    proc = await asyncio.create_subprocess_exec(*cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        out, err = await proc.communicate()
+    return proc.returncode, (out.decode() + err.decode()).strip()
+
+async def check_webserver_curl(base_url, insecure):
+    url = f"{base_url}/"
+    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-I", url]
+    if insecure: cmd.insert(1, "-k")
+    _, out = await run_cmd(cmd)
+    return out.strip()
+
+# ----------------------------
+# SSH helpers (minimal, compatible)
+# ----------------------------
+async def connect_password_only(host, port, username, password, timeout=15):
+    """
+    Minimal asyncssh.connect that:
+      - uses username/password
+      - skips known_hosts verification (known_hosts=None) so it behaves like PuTTY's 'accept'
+    Note: skipping host key verification is insecure on untrusted networks.
+    """
+    return await asyncio.wait_for(
+        asyncssh.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            known_hosts=None  # behave like PuTTY first-accept
+        ),
+        timeout
+    )
+
+# ----------------------------
+# LunaSH (SSH) functions
+# ----------------------------
+async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
+    """
+    Import role file, create user, assign role, set password.
+    Logs stdout/stderr for each LunaSH command (useful to see permission errors).
+    """
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+    local_role = os.path.join(ROLES_DIR, role_file)
+    role_name = os.path.splitext(os.path.basename(local_role))[0]
+    remote_role = f"/tmp/{os.path.basename(local_role)}"
+
+    conn = await connect_password_only(host, port, ssh_user, ssh_pass)
+    try:
+        async with conn:
+            # try SFTP upload; log if it fails
+            try:
+                async with conn.start_sftp_client() as sftp:
+                    await sftp.put(local_role, remote_role)
+                    print(f"[{hsm.get('id')}] uploaded role to {remote_role}")
+            except Exception as e:
+                print(f"[{hsm.get('id')}] sftp upload failed: {e} (will fallback to echo-based upload if needed)")
+                # fallback attempt: base64-echo upload (best-effort; may fail on restricted shells)
+                try:
+                    import base64
+                    data = base64.b64encode(open(local_role, "rb").read()).decode()
+                    # split into chunks to avoid overly long commands
+                    for i in range(0, len(data), 1500):
+                        chunk = data[i:i+1500]
+                        await conn.run(f"echo {chunk} >> {remote_role}.b64", check=False, term_type='xterm')
+                    await conn.run(f"base64 -d {remote_role}.b64 > {remote_role}", check=False, term_type='xterm')
+                    await conn.run(f"rm -f {remote_role}.b64", check=False, term_type='xterm')
+                    print(f"[{hsm.get('id')}] uploaded role via base64 fallback")
+                except Exception as e2:
+                    print(f"[{hsm.get('id')}] base64 fallback upload failed: {e2}")
+
+            steps = [
+                (f"user role import {role_name} {remote_role}", "role import"),
+                (f"user add {user} -password {pwd}", "user add"),
+                (f"user role add {user} {role_name}", "assign role"),
+            ]
+
+            for cmd, label in steps:
+                try:
+                    res = await conn.run(cmd, check=False, term_type='xterm')
+                    rc = getattr(res, "exit_status", None)
+                    stdout = (res.stdout or "").strip()
+                    stderr = (res.stderr or "").strip()
+                    print(f"[{hsm.get('id')}] {label}: rc={rc}")
+                    if stdout:
+                        print(f"[{hsm.get('id')}] {label} stdout: {stdout}")
+                    if stderr:
+                        print(f"[{hsm.get('id')}] {label} stderr: {stderr}")
+                    combined = (stdout + "\n" + stderr).lower()
+                    if "permission denied" in combined or "not authorized" in combined:
+                        raise RuntimeError(f"{label} permission problem: {combined.strip()}")
+                except Exception as e:
+                    raise RuntimeError(f"LunaSH {label} error: {e}")
+
+            # set password (interactive-style)
+            try:
+                res = await conn.run(f"user password {user}", input=(pwd + "\n" + pwd + "\n"), check=False, term_type='xterm')
+                rc = getattr(res, "exit_status", None)
+                stdout = (res.stdout or "").strip()
+                stderr = (res.stderr or "").strip()
+                print(f"[{hsm.get('id')}] set password rc={rc}")
+                if stdout: print(f"[{hsm.get('id')}] set password stdout: {stdout}")
+                if stderr: print(f"[{hsm.get('id')}] set password stderr: {stderr}")
+            except Exception as e:
+                print(f"[{hsm.get('id')}] set password error: {e}")
+
+            # verify
+            try:
+                out = (await conn.run("user list", check=False, term_type='xterm')).stdout or ""
+            except Exception:
+                out = ""
+            return user in out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+async def lunash_check_webserver(hsm, ssh_user, ssh_pass, insecure=False):
+    """
+    Prefer REST curl check; fall back to LunaSH 'webserver show' if needed.
+    """
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+    base = hsm.get("rest_url") or f"https://{host}:8443"
+
+    try:
+        code = await check_webserver_curl(base, insecure)
+        if code and str(code).strip().startswith("2"):
+            print(f"[{hsm.get('id')} | {host}] webserver: running (REST)")
+            return True
+    except Exception:
+        pass
+
+    try:
+        conn = await connect_password_only(host, port, ssh_user, ssh_pass)
+    except Exception as e:
+        print(f"[{hsm.get('id')} | {host}] webserver check connect failed: {e}")
+        return False
+
+    try:
+        async with conn:
+            res = await conn.run("webserver show", check=False, term_type='xterm')
+            out = (res.stdout or "") + (res.stderr or "")
+            if "running" in out.lower():
+                print(f"[{hsm.get('id')} | {host}] webserver: running (LunaSH)")
+                return True
+            print(f"[{hsm.get('id')} | {host}] webserver: not running (LunaSH)")
+            return False
+    except Exception as e:
+        print(f"[{hsm.get('id')} | {host}] webserver command failed: {e}")
+        return False
+
+async def test_ssh_one(hsm, ssh_user, ssh_pass):
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+    try:
+        conn = await connect_password_only(host, port, ssh_user, ssh_pass)
+    except Exception as e:
+        return False, f"connect failed: {e}"
+    try:
+        async with conn:
+            ulist = await conn.run("user list", check=False, term_type='xterm')
+            snippet = (ulist.stdout or "")[:400] + (ulist.stderr or "")[:400]
+            print(f"[{hsm.get('id')} | {host}] SSH OK, user list snippet:")
+            print(snippet)
+            return True, None
+    except Exception as e:
+        return False, f"session error: {e}"
+
+# ----------------------------
+# Orchestration per HSM
+# ----------------------------
+async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=False, skip_webserver=False, ssh_user=None):
+    hid = hsm.get("id")
+    fw = hsm.get("fwVersion")
+    host = hsm.get("ipAddress") or hsm.get("host") or "<no-host>"
+
+    try:
+        token = get_content_type_token(version_map, fw)
+    except KeyError as e:
+        print(f"[{hid}] Version map error: {e}")
+        write_failed({"hsm_id": hid, "stage": "version-map", "error": str(e)})
+        return {"hsm": hid, "status": "FAILED"}
+
+    ct_json = f"application/vnd.safenetinc.lunasa+json;version={token}"
+    ct_file = f"application/vnd.safenetinc.lunasa+file;version={token}"
+    print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
+
+    # choose ssh username (allow separate SSH user)
+    ssh_user = ssh_user or admin_user
+
+    if test_ssh_only:
+        ok = False
+        last_err = None
+        for attempt in range(1, SSH_RETRIES + 1):
+            ok, last_err = await test_ssh_one(hsm, ssh_user, admin_pass)
+            if ok:
+                break
+            print(f"[{hid}] SSH test attempt {attempt} failed: {last_err}")
+            if attempt < SSH_RETRIES:
+                await backoff_sleep(attempt)
+        if not ok:
+            write_failed({"hsm_id": hid, "stage": "ssh-test", "error": last_err})
+            return {"hsm": hid, "status": "SSH-FAILED", "error": last_err}
+        return {"hsm": hid, "status": "SSH-OK"}
+
+    user, pwd = gen_username(), gen_password()
+    base = hsm.get("rest_url") or f"https://{host}:8443"
+
+    # webserver check (REST preferred) unless skipped
+    if not skip_webserver:
+        ok = False
+        for attempt in range(1, SSH_RETRIES+1):
+            if await lunash_check_webserver(hsm, ssh_user, admin_pass, insecure):
+                ok = True
+                break
+            await backoff_sleep(attempt)
+        if not ok:
+            print(f"[{hid}] Webserver check failed")
+            write_failed({"hsm_id": hid, "stage": "webserver", "error": "Webserver not running"})
+            return {"hsm": hid, "status": "FAILED"}
+
+    # if firmware older than cmp, perform LunaSH role/user flow
+    if not check_fw_version(fw):
+        ok = False
+        for attempt in range(1, SSH_RETRIES+1):
+            try:
+                await lunash_setup(hsm, ssh_user, admin_pass, role_file, user, pwd)
+                ok = True
+                break
+            except Exception as e:
+                print(f"[{hid}] LunaSH setup attempt {attempt} failed: {e}")
+                if attempt < SSH_RETRIES:
+                    await backoff_sleep(attempt)
+        if not ok:
+            write_failed({"hsm_id": hid, "stage": "lunash", "error": "SSH failed"})
+            return {"hsm": hid, "status": "FAILED"}
+
+    # REST flow (unchanged)
+    try:
+        sid = await curl_auth(base, admin_user, admin_pass, ct_json, insecure)
+        rc = await curl_post_role(base, sid, ct_json, os.path.splitext(role_file)[0], insecure)
+        if rc not in (200,201,204,409):
+            raise RuntimeError(f"Role create failed (HTTP {rc})")
+        rc = await curl_put_rolefile(base, sid, ct_file, os.path.join(ROLES_DIR, role_file), os.path.splitext(role_file)[0], insecure)
+        if rc not in (200,201,204):
+            raise RuntimeError(f"Role upload failed (HTTP {rc})")
+        rc = await curl_post_user(base, sid, ct_json, user, pwd, os.path.splitext(role_file)[0], insecure)
+        if rc not in (200,201,204):
+            raise RuntimeError(f"User create failed (HTTP {rc})")
+        out = await curl_get_users(base, sid, ct_json, insecure)
+        if user not in out:
+            return {"hsm": hid, "status": "WARN", "user": user, "password": pwd}
+    except Exception as e:
+        print(f"[{hid}] REST error: {e}")
+        write_failed({"hsm_id": hid, "stage": "rest", "error": str(e)})
+        return {"hsm": hid, "status": "FAILED"}
+
+    return {"hsm": hid, "status": "OK", "user": user, "password": pwd, "note": "password will be forced to change at first login"}
+
+# ----------------------------
+# Runner
+# ----------------------------
+async def run_all(hsm_ids, admin_user, admin_pass, role_file, insecure, test_ssh_only=False, skip_webserver=False, ssh_user=None):
+    hsms = load_json(HSM_FILE).get("hsms", [])
+    version_map = load_json(VERSION_FILE)
+    lookup = {h["id"]: h for h in hsms}
+    tasks = []
+    for hid in hsm_ids:
+        if hid not in lookup:
+            print(f"[SKIP] {hid} not found in {HSM_FILE}")
+            continue
+        tasks.append(process_hsm(lookup[hid], admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=test_ssh_only, skip_webserver=skip_webserver, ssh_user=ssh_user))
+    return await asyncio.gather(*tasks)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hsm-ids", nargs="+", required=True)
+    parser.add_argument("--admin-user", required=True)
+    parser.add_argument("--role-file", default=DEFAULT_ROLE_FILE)
+    parser.add_argument("--insecure", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen, but do nothing")
+    parser.add_argument("--test-ssh", action="store_true", help="Only test SSH auth/connectivity and exit")
+    parser.add_argument("--skip-webserver", action="store_true", help="Skip webserver checks and attempt LunaSH ops directly")
+    parser.add_argument("--ssh-user", help="SSH username if different from admin user")
+    args = parser.parse_args()
+
+    admin_pass = getpass.getpass("Admin password: ")
+
+    if args.dry_run:
+        hsms = load_json(HSM_FILE).get("hsms", [])
+        version_map = load_json(VERSION_FILE)
+        lookup = {h["id"]: h for h in hsms}
+        print("\n=== DRY RUN MODE ===")
+        for hid in args.hsm_ids:
+            hsm = lookup.get(hid)
+            if not hsm:
+                print(f"[SKIP] {hid} not found in hsm_mapping.json")
+                continue
+            fw = hsm.get("fwVersion")
+            host = hsm.get("ipAddress") or hsm.get("host") or "<no-host>"
+            token = version_map.get(fw, "??")
+            user, pwd = gen_username(), gen_password()
+            print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
+            print(f" Would create user={user} pass={pwd} with role={os.path.splitext(args.role_file)[0]}")
+        print("=== END DRY RUN ===")
+        return
+
+    results = asyncio.run(run_all(args.hsm_ids, args.admin_user, admin_pass, args.role_file, args.insecure, test_ssh_only=args.test_ssh, skip_webserver=args.skip_webserver, ssh_user=args.ssh_user))
+    print("\nRESULTS:")
+    for r in results:
+        if r["status"] == "OK":
+            print(f"[{r['hsm']}] OK user={r['user']} pass={r['password']} ({r['note']})")
+        elif r["status"] == "WARN":
+            print(f"[{r['hsm']}] WARN user={r['user']} pass={r['password']} not verified")
+        else:
+            print(f"[{r['hsm']}] FAILED (see console above and resources/failed_jobs.jsonl)")
+
+if __name__ == "__main__":
+    main()

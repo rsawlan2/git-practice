@@ -1,42 +1,36 @@
 #!/usr/bin/env python3
 """
-Minimal Luna HSM user management script (firmware-aware role import).
+Minimal Luna HSM user management (base64-only uploader, LunaSH-safe).
 
-Usage examples:
-  # just test connection:
-  python luna_user_mgmt.py --hsm-id hsma1
-
-  # run connection + import role + create user:
-  python luna_user_mgmt.py --hsm-id hsma1 --role-file user_mgmt_role.txt --new-user alice
+Usage:
+  python luna_user_mgmt_base64_only.py --hsm-id hsma1
+  python luna_user_mgmt_base64_only.py --hsm-id hsma1 --role-file user_mgmt_role.txt --new-user alice
 """
 
 from __future__ import annotations
-import os, sys, json, socket, time, getpass, argparse, secrets, string, base64, subprocess, re
+import os, sys, json, time, getpass, argparse, secrets, string, base64, subprocess, re, socket
 from typing import Tuple
 
-# ---- install paramiko if missing ----
+# install paramiko if needed (we use it only for SSH)
 try:
     import paramiko
-except Exception:
-    print("[INFO] Installing paramiko...")
+except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko"])
     import paramiko
 
 from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
 
-# ---- script-relative paths ----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RES_DIR = os.path.join(BASE_DIR, "resources")
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
 ROLES_DIR = os.path.join(RES_DIR, "roles")
 
-# remote file MUST be a plain filename (no slashes) for many Luna firmwares
-DEFAULT_REMOTE_ROLE_FILENAME = "roledef.txt"
+# We upload base64 to /tmp/roledef.txt.b64 then decode to /tmp/roledef.txt
+REMOTE_B64 = "/tmp/roledef.txt.b64"
+REMOTE_ROLE = "/tmp/roledef.txt"
 SSH_TIMEOUT = 20.0
 
-# ---------------------------
-# Version helpers
-# ---------------------------
+# ---- helpers ----
 def parse_version_tuple(s: str) -> Tuple[int, ...]:
     if not s:
         return tuple()
@@ -49,9 +43,6 @@ def parse_version_tuple(s: str) -> Tuple[int, ...]:
             parts.append(0)
     return tuple(parts)
 
-# ---------------------------
-# Basic helpers
-# ---------------------------
 def load_hsm(hsm_id: str) -> dict:
     if not os.path.exists(HSM_FILE):
         raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
@@ -74,7 +65,7 @@ def ssh_connect(host: str, port: int, user: str, pwd: str, timeout: float = SSH_
     except (SSHException, socket.error) as e:
         raise SystemExit(f"[ERROR] SSH connection failed: {e}")
 
-def ssh_run(client: SSHClient, cmd: str, timeout: float = 15.0):
+def ssh_run(client: SSHClient, cmd: str, timeout: float = 30.0):
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode(errors="ignore") if stdout else ""
     err = stderr.read().decode(errors="ignore") if stderr else ""
@@ -83,19 +74,6 @@ def ssh_run(client: SSHClient, cmd: str, timeout: float = 15.0):
     except Exception:
         rc = -1
     return out, err, rc
-
-def check_webserver_status(client: SSHClient) -> str:
-    out, err, rc = ssh_run(client, "webserver show")
-    combined = (out + err).lower()
-    if "running" in combined or "enabled" in combined:
-        return "ENABLED"
-    if "not running" in combined or "stopped" in combined or "disabled" in combined:
-        return "DISABLED"
-    if "permission denied" in combined or "not authorized" in combined:
-        return "NO_PERMISSION"
-    if "not recognized" in combined or "unknown command" in combined:
-        return "NOT_SUPPORTED"
-    return "UNKNOWN"
 
 def gen_password(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
@@ -106,131 +84,84 @@ def gen_password(length: int = 16) -> str:
             return p
 
 def sh_escape(s: str) -> str:
-    # single-quote escape for POSIX shells
+    # single-quote safe escaping for echo
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
-# ---------------------------
-# Role upload + import (robust)
-# ---------------------------
-
-def sanitize_remote_name(name: str) -> str:
-    """Allow only a-zA-Z0-9._- ; else replace with underscore; max 64 chars."""
-    base = os.path.basename(name)
-    safe = re.sub(r'[^A-Za-z0-9._-]', '_', base)
-    if not safe:
-        return DEFAULT_REMOTE_ROLE_FILENAME
-    return safe[:64]
-
-def upload_role_file(client: SSHClient, local_file: str, remote_filename: str | None = None) -> str:
+# ---- base64 upload to /tmp ----
+def upload_via_base64_to_tmp(client: SSHClient, local_path: str) -> None:
     """
-    Normalize line endings (LF), strip BOM, upload file.
-    Returns the remote filename used (plain filename, no path).
+    Uploads local_path to REMOTE_B64 in chunks and decodes to REMOTE_ROLE.
+    Uses only echo/append and base64 -d which LunaSH supports on most devices.
     """
-    if not os.path.exists(local_file):
-        raise SystemExit(f"[ERROR] Role file not found: {local_file}")
+    if not os.path.exists(local_path):
+        raise SystemExit(f"[ERROR] Role file not found: {local_path}")
 
-    # normalize contents: remove BOM and convert CRLF->LF
-    data = open(local_file, "rb").read()
+    # normalize file (strip BOM, force LF) to avoid parser issues
+    data = open(local_path, "rb").read()
     if data.startswith(b'\xef\xbb\xbf'):
         data = data[3:]
     data = data.replace(b'\r\n', b'\n').replace(b'\r', b'\n')
 
-    norm_path = local_file + ".norm"
-    with open(norm_path, "wb") as fh:
-        fh.write(data)
+    b64 = base64.b64encode(data).decode()
 
-    # choose a plain remote filename
-    given = remote_filename or os.path.basename(local_file) or DEFAULT_REMOTE_ROLE_FILENAME
-    remote_name = sanitize_remote_name(given)
+    # remove any existing remote files (best-effort)
+    ssh_run(client, f"rm -f {REMOTE_B64} {REMOTE_ROLE}")
 
-    # try SFTP first
-    try:
-        sftp = client.open_sftp()
-        sftp.put(norm_path, remote_name)
-        sftp.close()
-        print(f"[INFO] Uploaded role file via SFTP to '{remote_name}'")
-    except Exception as e:
-        print(f"[WARN] SFTP failed ({e}), falling back to base64 upload.")
-        b64 = base64.b64encode(data).decode()
-        remote_b64 = remote_name + ".b64"
-        client.exec_command(f"rm -f {remote_name} {remote_b64}")
-        chunk_size = 1200
-        for i in range(0, len(b64), chunk_size):
-            chunk = b64[i:i+chunk_size]
-            client.exec_command(f"printf '%s' {sh_escape(chunk)} >> {remote_b64}")
-        client.exec_command(f"base64 -d {remote_b64} > {remote_name}")
-        client.exec_command(f"rm -f {remote_b64}")
-        print(f"[INFO] Uploaded role file via base64 to '{remote_name}'")
+    chunk_size = 1200
+    for i in range(0, len(b64), chunk_size):
+        chunk = b64[i:i+chunk_size]
+        # append chunk to remote base64 file using echo >> (safer for Luna)
+        # Use single-quote escaping
+        cmd = f"echo {sh_escape(chunk)} >> {REMOTE_B64}"
+        out, err, rc = ssh_run(client, cmd, timeout=10.0)
+        # we ignore rc here because some firmwares return nonzero for echo; but capture errors
+        if rc not in (0, None):
+            # print debug but continue — many Luna boxes return non-zero for some shell ops
+            print(f"[DEBUG] echo rc={rc} (ignored) out({out.strip()}) err({err.strip()})")
 
-    # verify remote file exists (ls), and show short preview (first 20 lines) if possible
-    out, err, rc = ssh_run(client, f"ls -l {remote_name}")
-    if rc == 0:
-        print(f"[INFO] Remote file: {out.strip().splitlines()[0] if out.strip() else remote_name}")
-    else:
-        print(f"[WARN] ls failed for '{remote_name}': {(err or out).strip()}")
+    # decode base64 to final role file
+    out, err, rc = ssh_run(client, f"base64 -d {REMOTE_B64} > {REMOTE_ROLE}", timeout=20.0)
+    if rc != 0:
+        raise SystemExit(f"[ERROR] base64 decode failed: {out or err}")
+    # cleanup b64
+    ssh_run(client, f"rm -f {REMOTE_B64}")
 
-    # preview first lines (some firmwares lack head; try head then sed)
-    out, err, rc = ssh_run(client, f"head -n 20 {remote_name}")
-    if rc == 0:
-        preview = out.strip().splitlines()
-        print("[INFO] Remote file preview (first lines):")
-        for line in preview[:20]:
-            print("  " + line)
-    else:
-        out, err, rc = ssh_run(client, f"sed -n '1,20p' {remote_name}")
-        if rc == 0:
-            preview = out.strip().splitlines()
-            print("[INFO] Remote file preview (first lines via sed):")
-            for line in preview[:20]:
-                print("  " + line)
-        else:
-            print("[WARN] Could not preview remote file (device may not support head/sed).")
+    print(f"[INFO] Uploaded role file to {REMOTE_ROLE} via base64.")
 
-    try:
-        os.remove(norm_path)
-    except Exception:
-        pass
-
-    return remote_name
-
-def import_role(client: SSHClient, hsm: dict, role_name: str, remote_filename: str) -> None:
-    """
-    Firmware-aware import. Tries syntaxes in order based on fwVersion and prints raw output.
-    Candidate syntaxes included:
-      - user role import -roleName <role> -file <file>   (new >=7.8)
-      - user role import -role <role> -file <file>       (mid 7.3..7.8)
-      - user role import <role> <file>                   (old)
-    """
+# ---- firmware-aware role import (includes positional with /tmp path) ----
+def import_role_firmware_aware(client: SSHClient, hsm: dict, role_name: str) -> None:
     fw = hsm.get("fwVersion") or ""
     fw_tuple = parse_version_tuple(fw)
 
+    # candidate syntaxes; the first that succeeds wins
+    # include both flagged variants and positional with /tmp path
     if fw_tuple >= parse_version_tuple("7.8.0"):
         candidates = [
-            f"user role import -roleName {role_name} -file {remote_filename}",
-            f"user role import -role {role_name} -file {remote_filename}",
-            f"user role import {role_name} {remote_filename}",
+            f"user role import -roleName {role_name} -file {REMOTE_ROLE}",
+            f"user role import -role {role_name} -file {REMOTE_ROLE}",
+            f"user role import {role_name} {REMOTE_ROLE}",
         ]
     elif fw_tuple >= parse_version_tuple("7.3.0"):
         candidates = [
-            f"user role import -role {role_name} -file {remote_filename}",
-            f"user role import {role_name} {remote_filename}",
-            f"user role import -roleName {role_name} -file {remote_filename}",
+            f"user role import -role {role_name} -file {REMOTE_ROLE}",
+            f"user role import {role_name} {REMOTE_ROLE}",
+            f"user role import -roleName {role_name} -file {REMOTE_ROLE}",
         ]
     else:
         candidates = [
-            f"user role import {role_name} {remote_filename}",
-            f"user role import -role {role_name} -file {remote_filename}",
-            f"user role import -roleName {role_name} -file {remote_filename}",
+            f"user role import {role_name} {REMOTE_ROLE}",
+            f"user role import -role {role_name} -file {REMOTE_ROLE}",
+            f"user role import -roleName {role_name} -file {REMOTE_ROLE}",
         ]
 
     last_err = None
     for cmd in candidates:
         print(f"[INFO] Trying import command: {cmd}")
-        out, err, rc = ssh_run(client, cmd, timeout=30.0)
+        out, err, rc = ssh_run(client, cmd, timeout=20.0)
         raw = (out or "") + (err or "")
-        print(f"[DEBUG] rc={rc} raw_output_start: {raw.strip()[:400]}")
+        print(f"[DEBUG] rc={rc} raw: {raw.strip()[:400]}")
         lower = raw.lower()
-        # heuristics for success
+        # success heuristic: rc==0 and no 'error' or 'syntax' tokens in reply
         if rc == 0 and "error" not in lower and "syntax" not in lower:
             print(f"[INFO] Role '{role_name}' imported successfully using: {cmd}")
             return
@@ -239,29 +170,27 @@ def import_role(client: SSHClient, hsm: dict, role_name: str, remote_filename: s
 
     raise SystemExit(f"[ERROR] Role import failed after trying syntaxes. Last error: {last_err}")
 
-# ---------------------------
-# User helpers
-# ---------------------------
-def add_user(client: SSHClient, username: str, password: str):
-    out, err, rc = ssh_run(client, f"user add -userName {username} -password {password}")
+# ---- user management helpers ----
+def add_user(client: SSHClient, username: str, password: str) -> None:
+    out, err, rc = ssh_run(client, f"user add -userName {username} -password {password}", timeout=20.0)
     if rc != 0:
         raise SystemExit(f"[ERROR] Add user failed: {out or err}")
     print(f"[INFO] User '{username}' created.")
 
-def assign_role(client: SSHClient, username: str, role_name: str):
-    out, err, rc = ssh_run(client, f"user role add {username} {role_name}")
+def assign_role(client: SSHClient, username: str, role_name: str) -> None:
+    out, err, rc = ssh_run(client, f"user role add {username} {role_name}", timeout=15.0)
     if rc != 0:
         raise SystemExit(f"[ERROR] Assign role failed: {out or err}")
     print(f"[INFO] Role '{role_name}' assigned to '{username}'.")
 
-def force_password_set_interactive(client: SSHClient, username: str, password: str, timeout: float = 5.0):
+def set_password_interactive(client: SSHClient, username: str, pwd: str, timeout: float = 6.0) -> None:
     chan = client.invoke_shell()
     time.sleep(0.2)
     chan.send(f"user password -userName {username}\n")
     time.sleep(0.2)
-    chan.send(password + "\n")
+    chan.send(pwd + "\n")
     time.sleep(0.2)
-    chan.send(password + "\n")
+    chan.send(pwd + "\n")
     buff = ""
     start = time.time()
     while time.time() - start < timeout:
@@ -274,16 +203,13 @@ def force_password_set_interactive(client: SSHClient, username: str, password: s
         raise SystemExit(f"[ERROR] Setting password failed: {buff.strip()}")
     print(f"[INFO] Password set for '{username}' (may require change at first login).")
 
-# ---------------------------
-# Main flow
-# ---------------------------
-
+# ---- main flow ----
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--hsm-id", required=True, help="HSM ID from resources/hsm_mapping.json")
-    p.add_argument("--cmd", help="Optional LunaSH command to run (if omitted, just confirm connection)")
-    p.add_argument("--role-file", help="Optional role filename inside resources/roles/")
-    p.add_argument("--new-user", help="Optional new username to create (if omitted, will prompt)")
+    p.add_argument("--hsm-id", required=True)
+    p.add_argument("--cmd", help="Optional LunaSH command to run")
+    p.add_argument("--role-file", help="Role filename in resources/roles/")
+    p.add_argument("--new-user", help="New username to create")
     args = p.parse_args()
 
     hsm = load_hsm(args.hsm_id)
@@ -296,37 +222,36 @@ def main():
     print(f"[INFO] Connecting to {host}:{port} as {user} ...")
     client = ssh_connect(host, port, user, pwd)
 
-    # webserver check
-    ws_status = check_webserver_status(client)
-    print(f"[WEB SERVER STATUS] {ws_status}")
+    # simple webserver check (LunaSH command)
+    out, err, rc = ssh_run(client, "webserver show", timeout=10.0)
+    combined = (out + err).lower()
+    if "running" in combined or "enabled" in combined:
+        print("[WEB SERVER STATUS] ENABLED")
+    else:
+        print("[WEB SERVER STATUS] NOT ENABLED or unknown")
 
-    # run command if provided, else confirm connection
     if args.cmd:
         out, err, rc = ssh_run(client, args.cmd)
-        print(f"\n--- Output of `{args.cmd}` ---")
-        if out: print(out.strip())
-        if err: print("--- STDERR ---\n" + err.strip())
-        print(f"[INFO] `{args.cmd}` exited with code {rc}")
+        print(out or err)
+        print(f"[INFO] `{args.cmd}` rc={rc}")
     else:
         print(f"[RESULT] SSH connection to {args.hsm_id} successful.")
 
-    # optional role + user flow
+    # optional role + user flow (base64 upload to /tmp)
     if args.role_file:
-        role_local_path = os.path.join(ROLES_DIR, args.role_file)
-        role_name = os.path.splitext(os.path.basename(role_local_path))[0]
-
-        if not os.path.exists(role_local_path):
+        role_local = os.path.join(ROLES_DIR, args.role_file)
+        if not os.path.exists(role_local):
             client.close()
-            raise SystemExit(f"[ERROR] Role file not found: {role_local_path}")
-
+            raise SystemExit(f"[ERROR] Role file not found: {role_local}")
+        role_name = os.path.splitext(os.path.basename(role_local))[0]
         new_user = args.new_user or input("New username to create: ").strip()
         temp_pwd = gen_password()
 
-        print(f"[INFO] Uploading role file '{role_local_path}' ...")
-        remote_name = upload_role_file(client, role_local_path, DEFAULT_REMOTE_ROLE_FILENAME)
+        print(f"[INFO] Uploading role file (base64) to {REMOTE_ROLE} ...")
+        upload_via_base64_to_tmp(client, role_local)
 
-        print(f"[INFO] Importing role '{role_name}' (fwVersion={hsm.get('fwVersion')}) ...")
-        import_role(client, hsm, role_name, remote_name)
+        print(f"[INFO] Importing role '{role_name}' (fw={hsm.get('fwVersion')}) ...")
+        import_role_firmware_aware(client, hsm, role_name)
 
         print(f"[INFO] Creating user '{new_user}' ...")
         add_user(client, new_user, temp_pwd)
@@ -335,7 +260,7 @@ def main():
         assign_role(client, new_user, role_name)
 
         print(f"[INFO] Attempting to set temporary password for '{new_user}' ...")
-        force_password_set_interactive(client, new_user, temp_pwd)
+        set_password_interactive(client, new_user, temp_pwd)
 
         print("\n[RESULT] User created:", new_user)
         print("Temporary password:", temp_pwd)

@@ -1,3 +1,29 @@
-hello
-change
 
+import asyncio, asyncssh
+
+async def run_lunash_cmd(host, user, password, cmd):
+    async with asyncssh.connect(
+        host,
+        port=22,
+        username=user,
+        password=password,
+        known_hosts=None,
+        client_keys=None
+    ) as conn:
+        proc = await conn.create_process(term_type='xterm')
+        proc.stdin.write(cmd + '\n')
+        await proc.stdin.drain()
+
+        # Read some output (LunaSH returns prompt + result)
+        output = await asyncio.wait_for(proc.stdout.readuntil('lunash>'), timeout=5)
+        return output
+
+async def main():
+    host = "10.24.128.69"
+    user = "t780952"
+    password = "YourPasswordHere"
+    out = await run_lunash_cmd(host, user, password, "user list")
+    print(out)
+
+if __name__ == "__main__":
+    asyncio.run(main())

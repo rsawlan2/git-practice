@@ -2,25 +2,21 @@
 """
 luna_user_mgmt.py
 
-- Reads HSM mapping from resources/hsm_mapping.json
-- Single username/password prompt (used for SSH)
-- Connects via SSH to HSM
-- If --cmd is passed, runs it; if not, confirms successful connection
-- Always checks webserver status
-- Optional: upload/import custom role file (resources/roles/), create user, assign role,
-            and attempt to set temporary password so user must change at first login.
-
-This version adds firmware-aware role import:
- - For fw >= 7.8.0 uses:  user role import -roleName <role> -file <path>
- - For older firmware uses: user role import <role> <path>
- - If version is missing or the first attempt fails, the fallback syntax will be tried once.
+- Uses resources/hsm_mapping.json to find host/port/fwVersion for an HSM id.
+- Prompts once for username/password (used for SSH).
+- Connects via SSH (Paramiko), checks webserver, and:
+  - If --cmd is provided, runs it and prints output.
+  - If --cmd is omitted, prints "SSH connection ... successful".
+- Optionally uploads a role file from resources/roles/, imports it (firmware-aware),
+  creates a new user with a generated temporary password, assigns the role,
+  and attempts to set the password interactively.
 """
 
 from __future__ import annotations
 import os, sys, json, socket, time, getpass, argparse, secrets, string, base64, subprocess
 from typing import Tuple
 
-# Ensure paramiko installed
+# Install paramiko if missing
 try:
     import paramiko
 except ImportError:
@@ -41,13 +37,13 @@ SSH_TIMEOUT = 20.0
 
 
 # -------------------------
-# Version helper
+# Version helpers
 # -------------------------
 def parse_version_tuple(s: str) -> Tuple[int, ...]:
-    """Parse version strings like '7.8.0-1' -> (7,8,0). Non-numeric parts stripped."""
-    s = (s or "").split("-")[0].strip()
+    """Parse version like '7.8.0-1' -> (7,8,0). Non-numeric parts stripped."""
     if not s:
         return tuple()
+    s = s.split("-")[0].strip()
     parts = []
     for p in s.split("."):
         try:
@@ -58,23 +54,19 @@ def parse_version_tuple(s: str) -> Tuple[int, ...]:
 
 
 def is_fw_at_least(fw: str, cmp_to: str = "7.8.0") -> bool:
-    """Return True if fw >= cmp_to (semantic-ish comparison)."""
     if not fw:
         return False
-    try:
-        return parse_version_tuple(fw) >= parse_version_tuple(cmp_to)
-    except Exception:
-        return False
+    return parse_version_tuple(fw) >= parse_version_tuple(cmp_to)
 
 
 # -------------------------
-# Helpers
+# Basic helpers
 # -------------------------
 def load_hsm(hsm_id: str) -> dict:
     if not os.path.exists(HSM_FILE):
         raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
-    with open(HSM_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    with open(HSM_FILE, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
     for h in data.get("hsms", []):
         if h.get("id") == hsm_id:
             return h
@@ -133,11 +125,12 @@ def sh_escape(s: str) -> str:
 
 
 # -------------------------
-# Role/User helpers (firmware-aware import)
+# Role / User helpers (firmware-aware import)
 # -------------------------
 def upload_role_file(client: SSHClient, local_file: str, remote_file: str = DEFAULT_REMOTE_ROLE_PATH) -> str:
     if not os.path.exists(local_file):
         raise SystemExit(f"[ERROR] Role file not found: {local_file}")
+    # Try SFTP
     try:
         sftp = client.open_sftp()
         sftp.put(local_file, remote_file)
@@ -146,7 +139,7 @@ def upload_role_file(client: SSHClient, local_file: str, remote_file: str = DEFA
         return remote_file
     except Exception:
         print("[WARN] SFTP failed, falling back to base64 upload.")
-
+    # Base64 fallback
     with open(local_file, "rb") as fh:
         b64 = base64.b64encode(fh.read()).decode()
     remote_b64 = remote_file + ".b64"
@@ -163,44 +156,47 @@ def upload_role_file(client: SSHClient, local_file: str, remote_file: str = DEFA
 
 def import_role(client: SSHClient, hsm: dict, role_name: str, remote_path: str) -> None:
     """
-    Firmware-aware import:
-      - If fwVersion >= 7.8.0 use: user role import -roleName <role> -file <path>
-      - Else use: user role import <role> <path>
-    If the chosen syntax fails, attempt the alternate syntax once as a fallback.
+    Firmware-aware role import with multiple candidate syntaxes:
+      - Newer (>= 7.8.0):   user role import -roleName <role> -file <path>
+      - Mid (>= 7.3.0):     user role import -role <role> -file <path>
+      - Old (< 7.3.0):      user role import <role> <path>
+    The function prefers the syntax based on fwVersion in the hsm mapping,
+    and falls back to other syntaxes if the first attempt fails.
     """
     fw = hsm.get("fwVersion") or ""
-    use_new = is_fw_at_least(fw, "7.8.0")
+    fw_tuple = parse_version_tuple(fw)
 
-    tried = []
+    # Candidate commands in preferred order (based on firmware)
+    if fw_tuple >= parse_version_tuple("7.8.0"):
+        candidates = [
+            f"user role import -roleName {role_name} -file {remote_path}",
+            f"user role import -role {role_name} -file {remote_path}",
+            f"user role import {role_name} {remote_path}",
+        ]
+    elif fw_tuple >= parse_version_tuple("7.3.0"):
+        candidates = [
+            f"user role import -role {role_name} -file {remote_path}",
+            f"user role import {role_name} {remote_path}",
+            f"user role import -roleName {role_name} -file {remote_path}",
+        ]
+    else:
+        candidates = [
+            f"user role import {role_name} {remote_path}",
+            f"user role import -role {role_name} -file {remote_path}",
+            f"user role import -roleName {role_name} -file {remote_path}",
+        ]
+
     last_err = None
-
-    def _try(cmd: str) -> Tuple[bool, str]:
+    for cmd in candidates:
         out, err, rc = ssh_run(client, cmd)
         combined = (out + err).lower()
-        success = (rc == 0) and ("error" not in combined and "syntax" not in combined)
-        msg = out or err
-        return success, msg
-
-    # build candidate commands in preferred order
-    candidates = []
-    if use_new:
-        candidates.append(f"user role import -roleName {role_name} -file {remote_path}")
-        candidates.append(f"user role import {role_name} {remote_path}")
-    else:
-        candidates.append(f"user role import {role_name} {remote_path}")
-        candidates.append(f"user role import -roleName {role_name} -file {remote_path}")
-
-    for cmd in candidates:
-        tried.append(cmd)
-        success, msg = _try(cmd)
-        if success:
+        if rc == 0 and "error" not in combined and "syntax" not in combined:
             print(f"[INFO] Role '{role_name}' imported successfully using: {cmd}")
             return
-        last_err = msg
-        print(f"[WARN] Role import attempt failed ({cmd}): {msg.strip()}")
+        print(f"[WARN] Role import attempt failed ({cmd}): {(out or err).strip()}")
+        last_err = out or err
 
-    # all attempts failed
-    raise SystemExit(f"[ERROR] Role import failed after trying syntaxes.\nTried: {tried}\nLast error: {last_err}")
+    raise SystemExit(f"[ERROR] Role import failed after trying syntaxes. Last error: {last_err}")
 
 
 def add_user(client: SSHClient, username: str, password: str):
@@ -235,7 +231,7 @@ def force_password_set_interactive(client: SSHClient, username: str, password: s
     chan.close()
     if "permission denied" in buff.lower() or "not authorized" in buff.lower():
         raise SystemExit(f"[ERROR] Setting password failed: {buff.strip()}")
-    print(f"[INFO] Password set for '{username}' (will need to change at first login).")
+    print(f"[INFO] Password set for '{username}' (may require change at first login).")
 
 
 # -------------------------

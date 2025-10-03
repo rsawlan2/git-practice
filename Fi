@@ -18,7 +18,7 @@ except Exception:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "asyncssh", "portalocker"])
     import asyncssh, portalocker
 
-import os, json, asyncio, secrets, string, random, getpass, time, shutil, sys
+import os, json, asyncio, secrets, string, random, getpass
 
 # Config
 RES_DIR = "resources"
@@ -54,6 +54,7 @@ def gen_password(length=16):
             return p
 
 async def backoff_sleep(attempt):
+    import random
     base = BACKOFF_BASE * (BACKOFF_FACTOR ** (attempt - 1))
     jitter = random.uniform(-BACKOFF_JITTER, BACKOFF_JITTER)
     await asyncio.sleep(max(0, base + jitter))
@@ -74,38 +75,32 @@ async def run_cmd(cmd, timeout=30):
     proc = await asyncio.create_subprocess_exec(*cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE)
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        out, err = await proc.communicate()
+    out, err = await proc.communicate()
     return proc.returncode, (out.decode() + err.decode()).strip()
 
 async def check_webserver_curl(base_url, insecure):
     url = f"{base_url}/"
     cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-I", url]
     if insecure: cmd.insert(1, "-k")
-    rc, out = await run_cmd(cmd)
+    _, out = await run_cmd(cmd)
     return out.strip()
 
-# robust asyncssh connect helper
+# --- FIXED: force password-only connect, skip host key verification (like PuTTY auto-accept)
 async def connect_password_only(host, port, username, password, timeout=15):
-    tried = []
-    last_exc = None
-    candidates = [
-        {"known_hosts": None, "client_keys": None, "allow_agent": False, "look_for_keys": False},
-        {"allow_agent": False, "look_for_keys": False},
-        {"allow_agent": False},
-        {}
-    ]
-    for kwargs in candidates:
-        try:
-            tried.append(kwargs)
-            conn = await asyncio.wait_for(asyncssh.connect(host, port=port, username=username, password=password, **kwargs), timeout)
-            return conn
-        except Exception as e:
-            last_exc = e
-    raise RuntimeError(f"asyncssh.connect failed, tried={tried}, last_error={last_exc!r}")
+    return await asyncio.wait_for(
+        asyncssh.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            known_hosts=None,          # don’t check known_hosts
+            client_keys=None,
+            allow_agent=False,
+            look_for_keys=False,
+            server_host_key_algs=None  # accept any host key
+        ),
+        timeout
+    )
 
 # SSH / LunaSH functions
 async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
@@ -115,56 +110,15 @@ async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
     role_name = os.path.splitext(os.path.basename(local_role))[0]
     remote_role = f"/tmp/{os.path.basename(local_role)}"
     conn = await connect_password_only(host, port, ssh_user, ssh_pass)
-    try:
-        async with conn:
-            try:
-                async with conn.start_sftp_client() as sftp:
-                    sftp.put(local_role, remote_role)
-            except Exception:
-                # fallback: upload via base64 echo if SFTP fails
-                try:
-                    import base64
-                    with open(local_role, "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode()
-                    # chunk to avoid too long lines
-                    chunks = [b64[i:i+2000] for i in range(0, len(b64), 2000)]
-                    await conn.run(f"rm -f {remote_role}.b64 || true", check=False, term_type='xterm')
-                    for chunk in chunks:
-                        await conn.run(f"echo {chunk} >> {remote_role}.b64", check=False, term_type='xterm')
-                    await conn.run(f"base64 -d {remote_role}.b64 > {remote_role} || cat {remote_role}.b64 | base64 -d > {remote_role}", check=False, term_type='xterm')
-                    await conn.run(f"rm -f {remote_role}.b64", check=False, term_type='xterm')
-                except Exception:
-                    pass
-
-            steps = [
-                (f"user role import {role_name} {remote_role}", "role import"),
-                (f"user add {user} -password {pwd}", "user add"),
-                (f"user role add {user} {role_name}", "assign role"),
-            ]
-            for cmd, label in steps:
-                try:
-                    res = await conn.run(cmd, check=False, term_type='xterm')
-                    status = "OK" if res.exit_status == 0 else "FAIL"
-                except Exception as e:
-                    status = f"ERR ({e})"
-                print(f"[{hsm.get('id')}] {label}: {status}")
-
-            try:
-                res = await conn.run(f"user password {user}", input=(pwd + "\n" + pwd + "\n"), check=False, term_type='xterm')
-                print(f"[{hsm.get('id')}] set password: {'OK' if res.exit_status == 0 else 'FAIL'}")
-            except Exception as e:
-                print(f"[{hsm.get('id')}] set password: ERR ({e})")
-
-            try:
-                out = (await conn.run("user list", check=False, term_type='xterm')).stdout or ""
-            except Exception:
-                out = ""
-            return user in out
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    async with conn:
+        async with conn.start_sftp_client() as sftp:
+            await sftp.put(local_role, remote_role)
+        await conn.run(f"user role import {role_name} {remote_role}", check=False, term_type='xterm')
+        await conn.run(f"user add {user} -password {pwd}", check=False, term_type='xterm')
+        await conn.run(f"user role add {user} {role_name}", check=False, term_type='xterm')
+        await conn.run(f"user password {user}", input=(pwd + "\n" + pwd + "\n"), check=False, term_type='xterm')
+        out = (await conn.run("user list", check=False, term_type='xterm')).stdout or ""
+        return user in out
 
 async def lunash_check_webserver(hsm, ssh_user, ssh_pass, insecure=False):
     host = hsm.get("ipAddress") or hsm.get("host")
@@ -172,36 +126,24 @@ async def lunash_check_webserver(hsm, ssh_user, ssh_pass, insecure=False):
     base = hsm.get("rest_url") or f"https://{host}:8443"
     try:
         code = await check_webserver_curl(base, insecure)
-        if code and str(code).strip().startswith("2"):
+        if code and code.startswith("2"):
             print(f"[{hsm.get('id')} | {host}] webserver: running (REST)")
             return True
     except Exception:
         pass
-
     try:
         conn = await connect_password_only(host, port, ssh_user, ssh_pass)
     except Exception as e:
-        print(f"[{hsm.get('id')} | {host}] webserver check error: connect failed: {e}")
+        print(f"[{hsm.get('id')} | {host}] webserver check error: {e}")
         return False
-
-    try:
-        async with conn:
-            try:
-                res = await conn.run("webserver show", check=False, term_type='xterm')
-            except Exception as e:
-                print(f"[{hsm.get('id')} | {host}] webserver check error during command: {e}")
-                return False
-            out = (res.stdout or "") + (res.stderr or "")
-            if "running" in out.lower():
-                print(f"[{hsm.get('id')} | {host}] webserver: running (LunaSH)")
-                return True
-            print(f"[{hsm.get('id')} | {host}] webserver: not running (LunaSH)")
-            return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    async with conn:
+        res = await conn.run("webserver show", check=False, term_type='xterm')
+        out = (res.stdout or "") + (res.stderr or "")
+        if "running" in out.lower():
+            print(f"[{hsm.get('id')} | {host}] webserver: running (LunaSH)")
+            return True
+        print(f"[{hsm.get('id')} | {host}] webserver: not running (LunaSH)")
+        return False
 
 async def test_ssh_one(hsm, ssh_user, ssh_pass):
     host = hsm.get("ipAddress") or hsm.get("host")
@@ -210,24 +152,12 @@ async def test_ssh_one(hsm, ssh_user, ssh_pass):
         conn = await connect_password_only(host, port, ssh_user, ssh_pass)
     except Exception as e:
         return False, f"connect failed: {e}"
-    try:
-        async with conn:
-            try:
-                ulist = await conn.run("user list", check=False, term_type='xterm')
-                snippet = (ulist.stdout or "")[:400] + (ulist.stderr or "")[:400]
-                print(f"[{hsm.get('id')} | {host}] SSH OK, user list snippet:")
-                print(snippet)
-                return True, None
-            except Exception as cmd_e:
-                print(f"[{hsm.get('id')} | {host}] SSH OK, but 'user list' failed: {cmd_e}")
-                return True, str(cmd_e)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    async with conn:
+        ulist = await conn.run("user list", check=False, term_type='xterm')
+        print(f"[{hsm.get('id')} | {host}] SSH OK, user list snippet:\n{(ulist.stdout or '')[:200]}")
+        return True, None
 
-# Orchestration (unchanged logic)
+# Orchestration per HSM
 async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=False):
     hid = hsm.get("id")
     fw = hsm.get("fwVersion")
@@ -263,35 +193,22 @@ async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insec
     base = hsm.get("rest_url") or f"https://{host}:8443"
 
     ok = False
-    last_err = None
     for attempt in range(1, SSH_RETRIES+1):
-        try:
-            if await lunash_check_webserver(hsm, admin_user, admin_pass):
-                ok = True
-                break
-        except Exception as e:
-            last_err = str(e)
-            print(f"[{hid}] webserver check attempt {attempt} error: {last_err}")
+        if await lunash_check_webserver(hsm, admin_user, admin_pass):
+            ok = True
+            break
         await backoff_sleep(attempt)
     if not ok:
-        print(f"[{hid}] Webserver check failed (via LunaSH/REST)")
-        write_failed({"hsm_id": hid, "stage": "webserver", "error": "Webserver not running (LunaSH/REST)"})
+        print(f"[{hid}] Webserver check failed")
+        write_failed({"hsm_id": hid, "stage": "webserver", "error": "Webserver not running"})
         return {"hsm": hid, "status": "FAILED"}
 
     if not check_fw_version(fw):
-        ssh_user = admin_user
-        ok = False
-        for attempt in range(1, SSH_RETRIES+1):
-            try:
-                await lunash_setup(hsm, ssh_user, admin_pass, role_file, user, pwd)
-                ok = True
-                break
-            except Exception as e:
-                print(f"[{hid}] SSH attempt {attempt} failed: {e}")
-                if attempt < SSH_RETRIES:
-                    await backoff_sleep(attempt)
-        if not ok:
-            write_failed({"hsm_id": hid, "stage": "lunash", "error": "SSH failed"})
+        try:
+            await lunash_setup(hsm, admin_user, admin_pass, role_file, user, pwd)
+        except Exception as e:
+            print(f"[{hid}] LunaSH setup failed: {e}")
+            write_failed({"hsm_id": hid, "stage": "lunash", "error": str(e)})
             return {"hsm": hid, "status": "FAILED"}
 
     try:

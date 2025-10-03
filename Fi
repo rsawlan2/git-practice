@@ -4,13 +4,9 @@ user_mgmt.py
 
 Automates creation of a user-management role + user on Luna HSMs.
 
-- Reads HSM mapping (resources/hsm_mapping.json)
-- Looks up REST Content-Type version (resources/version_map.json)
-- Uses role file (resources/roles/<role-file>)
-- Handles both LunaSH (pre-7.8 firmware) and REST API calls
-- Generates username + temporary password
-- Forces password change at first login
-- Prints clear results, logs failures to resources/failed_jobs.jsonl
+Added flags:
+  --dry-run    : Show what would happen, but do nothing
+  --test-ssh   : Test SSH login only (runs whoami + user list), then exit
 """
 
 # --- Dependency bootstrap ---
@@ -88,6 +84,14 @@ async def run_cmd(cmd):
     out, err = await proc.communicate()
     return proc.returncode, (out.decode() + err.decode()).strip()
 
+async def check_webserver_curl(base_url, insecure):
+    """Check if HSM webserver is reachable on 8443 via curl."""
+    url = f"{base_url}/"
+    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-I", url]
+    if insecure: cmd.insert(1, "-k")
+    _, out = await run_cmd(cmd)
+    return out.strip()
+
 async def curl_auth(base_url, admin_user, admin_pass, ct, insecure):
     url = f"{base_url}/auth/session"
     cmd = ["curl", "-s", "-S", "-i", "-X", "POST",
@@ -150,10 +154,13 @@ async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
 
     try:
         async with asyncssh.connect(
-            host, port=port,
+            host,
+            port=port,
             username=ssh_user,
             password=ssh_pass,
             known_hosts=None,
+            client_keys=None,
+            password_auth=False,
             kbd_interactive_auth=True
         ) as conn:
             async with conn.start_sftp_client() as sftp:
@@ -173,19 +180,20 @@ async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
     port = int(hsm.get("port", 22))
     try:
         async with asyncssh.connect(
-            host, port=port,
+            host,
+            port=port,
             username=ssh_user,
             password=ssh_pass,
             known_hosts=None,
+            client_keys=None,
+            password_auth=False,
             kbd_interactive_auth=True
         ) as conn:
             res = await conn.run("webserver show", check=False)
-            # Always print raw output so we can debug formatting
             print("==== RAW OUTPUT FROM HSM ====")
             print(res.stdout)
             print("==== END RAW OUTPUT ====")
             out = res.stdout.lower()
-            # Relaxed match: require presence of both words so we don't false-negative on formatting
             if ("status" in out) and ("running" in out):
                 return True
             return False
@@ -194,9 +202,38 @@ async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
         return False
 
 # ----------------------------
+# SSH test-only helper
+# ----------------------------
+async def test_ssh_one(hsm, ssh_user, ssh_pass):
+    """Connect and run a couple of simple commands to verify auth."""
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+    try:
+        async with asyncssh.connect(
+            host,
+            port=port,
+            username=ssh_user,
+            password=ssh_pass,
+            known_hosts=None,
+            client_keys=None,
+            password_auth=False,
+            kbd_interactive_auth=True
+        ) as conn:
+            # run simple checks
+            who = await conn.run("whoami", check=False)
+            ulist = await conn.run("user list", check=False)
+            print(f"[{hsm.get('id')} | {host}] whoami stdout:")
+            print(who.stdout.strip())
+            print(f"[{hsm.get('id')} | {host}] user list (first 200 chars):")
+            print(ulist.stdout[:200])
+            return True, None
+    except Exception as e:
+        return False, str(e)
+
+# ----------------------------
 # Orchestration per HSM
 # ----------------------------
-async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insecure):
+async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=False):
     hid = hsm.get("id")
     fw = hsm.get("fwVersion")
     host = hsm.get("ipAddress") or hsm.get("host") or "<no-host>"
@@ -211,6 +248,22 @@ async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insec
     ct_json = f"application/vnd.safenetinc.lunasa+json;version={token}"
     ct_file = f"application/vnd.safenetinc.lunasa+file;version={token}"
     print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
+
+    # If test-ssh-only requested, just validate SSH and return
+    if test_ssh_only:
+        ok = False
+        last_err = None
+        for attempt in range(1, SSH_RETRIES + 1):
+            ok, last_err = await test_ssh_one(hsm, admin_user, admin_pass)
+            if ok:
+                break
+            print(f"[{hid}] SSH test attempt {attempt} failed: {last_err}")
+            if attempt < SSH_RETRIES:
+                await backoff_sleep(attempt)
+        if not ok:
+            write_failed({"hsm_id": hid, "stage": "ssh-test", "error": last_err})
+            return {"hsm": hid, "status": "SSH-FAILED", "error": last_err}
+        return {"hsm": hid, "status": "SSH-OK"}
 
     user, pwd = gen_username(), gen_password()
     base = hsm.get("rest_url") or f"https://{host}:8443"
@@ -268,12 +321,16 @@ async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insec
 # ----------------------------
 # Runner
 # ----------------------------
-async def run_all(hsm_ids, admin_user, admin_pass, role_file, insecure):
+async def run_all(hsm_ids, admin_user, admin_pass, role_file, insecure, test_ssh_only=False):
     hsms = load_json(HSM_FILE).get("hsms", [])
     version_map = load_json(VERSION_FILE)
     lookup = {h["id"]: h for h in hsms}
-    tasks = [process_hsm(lookup[hid], admin_user, admin_pass, role_file, version_map, insecure)
-             for hid in hsm_ids if hid in lookup]
+    tasks = []
+    for hid in hsm_ids:
+        if hid not in lookup:
+            print(f"[SKIP] {hid} not found in {HSM_FILE}")
+            continue
+        tasks.append(process_hsm(lookup[hid], admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=test_ssh_only))
     return await asyncio.gather(*tasks)
 
 def main():
@@ -284,6 +341,7 @@ def main():
     parser.add_argument("--role-file", default=DEFAULT_ROLE_FILE)
     parser.add_argument("--insecure", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen, but do nothing")
+    parser.add_argument("--test-ssh", action="store_true", help="Only test SSH auth/connectivity and exit")
     args = parser.parse_args()
 
     admin_pass = getpass.getpass("Admin password: ")
@@ -306,6 +364,14 @@ def main():
             print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
             print(f" Would create user={user} pass={pwd} with role={os.path.splitext(args.role_file)[0]}")
         print("=== END DRY RUN ===")
+        return
+
+    # Test SSH-only mode
+    if args.test_ssh:
+        results = asyncio.run(run_all(args.hsm_ids, args.admin_user, admin_pass, args.role_file, args.insecure, test_ssh_only=True))
+        print("\nSSH TEST RESULTS:")
+        for r in results:
+            print(r)
         return
 
     # Normal execution

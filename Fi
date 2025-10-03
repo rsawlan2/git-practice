@@ -156,7 +156,6 @@ async def connect_password_only(host, port, username, password):
             look_for_keys=False
         )
     except TypeError:
-        # fallback for asyncssh version mismatch
         return await asyncssh.connect(
             host,
             port=port,
@@ -172,32 +171,30 @@ async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
     local_role = os.path.join(ROLES_DIR, role_file)
     role_name = os.path.splitext(os.path.basename(local_role))[0]
     remote_role = f"/tmp/{os.path.basename(local_role)}"
-    try:
-        async with await connect_password_only(host, port, ssh_user, ssh_pass) as conn:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.put(local_role, remote_role)
-            for cmd, label in [
-                (f"user role import {role_name} {remote_role}", "role import"),
-                (f"user add {user} -password {pwd}", "user add"),
-                (f"user role add {user} {role_name}", "assign role"),
-            ]:
-                res = await conn.run(cmd, check=False, term_type='xterm')
-                print(f"[{hsm.get('id')}] {label}: {'OK' if res.exit_status == 0 else 'FAIL'}")
-            res = await conn.run(f"user password {user}", input=(pwd + "\n" + pwd + "\n"),
-                                 check=False, term_type='xterm')
-            print(f"[{hsm.get('id')}] set password: {'OK' if res.exit_status == 0 else 'FAIL'}")
-            out = (await conn.run("user list", check=False, term_type='xterm')).stdout
-            return user in out
-    except Exception as e:
-        raise RuntimeError(f"LunaSH error: {e}")
+    async with await connect_password_only(host, port, ssh_user, ssh_pass) as conn:
+        async with conn.start_sftp_client() as sftp:
+            await sftp.put(local_role, remote_role)
+        steps = [
+            (f"user role import {role_name} {remote_role}", "role import"),
+            (f"user add {user} -password {pwd}", "user add"),
+            (f"user role add {user} {role_name}", "assign role"),
+        ]
+        for cmd, label in steps:
+            res = await conn.run(cmd, check=False, term_type='xterm')
+            print(f"[{hsm.get('id')}] {label}: {'OK' if res.exit_status == 0 else 'FAIL'}")
+        res = await conn.run(f"user password {user}", input=(pwd + "\n" + pwd + "\n"),
+                             check=False, term_type='xterm')
+        print(f"[{hsm.get('id')}] set password: {'OK' if res.exit_status == 0 else 'FAIL'}")
+        out = (await conn.run("user list", check=False, term_type='xterm')).stdout
+        return user in out
 
 async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
     host = hsm.get("ipAddress") or hsm.get("host")
     port = int(hsm.get("port", 22))
     base = hsm.get("rest_url") or f"https://{host}:8443"
     try:
-        rc, out = await run_cmd(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-I", base])
-        if str(out).startswith("2"):
+        code = await check_webserver_curl(base, False)
+        if code.startswith("2"):
             print(f"[{hsm.get('id')} | {host}] webserver: running (REST)")
             return True
     except Exception:
@@ -209,9 +206,7 @@ async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
             if ("status" in out) and ("running" in out):
                 print(f"[{hsm.get('id')} | {host}] webserver: running (LunaSH)")
                 return True
-            else:
-                print(f"[{hsm.get('id')} | {host}] webserver: not running (LunaSH)")
-                return False
+            return False
     except Exception as e:
         print(f"[{hsm.get('id')} | {host}] webserver check error: {e}")
         return False
@@ -222,8 +217,7 @@ async def test_ssh_one(hsm, ssh_user, ssh_pass):
     try:
         async with await connect_password_only(host, port, ssh_user, ssh_pass) as conn:
             ulist = await conn.run("user list", check=False, term_type='xterm')
-            print(f"[{hsm.get('id')} | {host}] SSH OK, user list snippet:")
-            print((ulist.stdout or "")[:200])
+            print(f"[{hsm.get('id')} | {host}] SSH OK, user list snippet:\n{(ulist.stdout or '')[:200]}")
             return True, None
     except Exception as e:
         return False, str(e)
@@ -231,127 +225,3 @@ async def test_ssh_one(hsm, ssh_user, ssh_pass):
 # ----------------------------
 # Orchestration per HSM
 # ----------------------------
-async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=False):
-    hid = hsm.get("id")
-    fw = hsm.get("fwVersion")
-    host = hsm.get("ipAddress") or hsm.get("host") or "<no-host>"
-    try:
-        token = get_content_type_token(version_map, fw)
-    except KeyError as e:
-        print(f"[{hid}] Version map error: {e}")
-        write_failed({"hsm_id": hid, "stage": "version-map", "error": str(e)})
-        return {"hsm": hid, "status": "FAILED"}
-    ct_json = f"application/vnd.safenetinc.lunasa+json;version={token}"
-    ct_file = f"application/vnd.safenetinc.lunasa+file;version={token}"
-    print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
-    if test_ssh_only:
-        ok = False
-        last_err = None
-        for attempt in range(1, SSH_RETRIES + 1):
-            ok, last_err = await test_ssh_one(hsm, admin_user, admin_pass)
-            if ok:
-                break
-            print(f"[{hid}] SSH test attempt {attempt} failed: {last_err}")
-            if attempt < SSH_RETRIES:
-                await backoff_sleep(attempt)
-        if not ok:
-            write_failed({"hsm_id": hid, "stage": "ssh-test", "error": last_err})
-            return {"hsm": hid, "status": "SSH-FAILED", "error": last_err}
-        return {"hsm": hid, "status": "SSH-OK"}
-    user, pwd = gen_username(), gen_password()
-    base = hsm.get("rest_url") or f"https://{host}:8443"
-    ok = False
-    for attempt in range(1, SSH_RETRIES+1):
-        if await lunash_check_webserver(hsm, admin_user, admin_pass):
-            ok = True
-            break
-        await backoff_sleep(attempt)
-    if not ok:
-        print(f"[{hid}] Webserver check failed (via LunaSH/REST)")
-        write_failed({"hsm_id": hid, "stage": "webserver", "error": "Webserver not running"})
-        return {"hsm": hid, "status": "FAILED"}
-    if not check_fw_version(fw):
-        ssh_user = admin_user
-        ok = False
-        for attempt in range(1, SSH_RETRIES+1):
-            try:
-                await lunash_setup(hsm, ssh_user, admin_pass, role_file, user, pwd)
-                ok = True; break
-            except Exception as e:
-                print(f"[{hid}] SSH attempt {attempt} failed: {e}")
-                if attempt < SSH_RETRIES:
-                    await backoff_sleep(attempt)
-        if not ok:
-            write_failed({"hsm_id": hid, "stage": "lunash", "error": "SSH failed"})
-            return {"hsm": hid, "status": "FAILED"}
-    try:
-        sid = await curl_auth(base, admin_user, admin_pass, ct_json, insecure)
-        rc = await curl_post_role(base, sid, ct_json, os.path.splitext(role_file)[0], insecure)
-        if rc not in (200,201,204,409):
-            raise RuntimeError(f"Role create failed (HTTP {rc})")
-        rc = await curl_put_rolefile(base, sid, ct_file, os.path.join(ROLES_DIR, role_file), os.path.splitext(role_file)[0], insecure)
-        if rc not in (200,201,204):
-            raise RuntimeError(f"Role upload failed (HTTP {rc})")
-        rc = await curl_post_user(base, sid, ct_json, user, pwd, os.path.splitext(role_file)[0], insecure)
-        if rc not in (200,201,204):
-            raise RuntimeError(f"User create failed (HTTP {rc})")
-        out = await curl_get_users(base, sid, ct_json, insecure)
-        if user not in out:
-            return {"hsm": hid, "status": "WARN", "user": user, "password": pwd}
-    except Exception as e:
-        print(f"[{hid}] REST error: {e}")
-        write_failed({"hsm_id": hid, "stage": "rest", "error": str(e)})
-        return {"hsm": hid, "status": "FAILED"}
-    return {"hsm": hid, "status": "OK", "user": user, "password": pwd, "note": "password will be forced to change at first login"}
-
-# ----------------------------
-# Runner
-# ----------------------------
-async def run_all(hsm_ids, admin_user, admin_pass, role_file, insecure, test_ssh_only=False):
-    hsms = load_json(HSM_FILE).get("hsms", [])
-    version_map = load_json(VERSION_FILE)
-    lookup = {h["id"]: h for h in hsms}
-    tasks = []
-    for hid in hsm_ids:
-        if hid not in lookup:
-            print(f"[SKIP] {hid} not found in {HSM_FILE}")
-            continue
-        tasks.append(process_hsm(lookup[hid], admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=test_ssh_only))
-    return await asyncio.gather(*tasks)
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hsm-ids", nargs="+", required=True)
-    parser.add_argument("--admin-user", required=True)
-    parser.add_argument("--role-file", default=DEFAULT_ROLE_FILE)
-    parser.add_argument("--insecure", action="store_true")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would happen, but do nothing")
-    parser.add_argument("--test-ssh", action="store_true", help="Only test SSH auth/connectivity and exit")
-    args = parser.parse_args()
-    admin_pass = getpass.getpass("Admin password: ")
-    if args.dry_run:
-        hsms = load_json(HSM_FILE).get("hsms", [])
-        version_map = load_json(VERSION_FILE)
-        lookup = {h["id"]: h for h in hsms}
-        print("\n=== DRY RUN MODE ===")
-        for hid in args.hsm_ids:
-            hsm = lookup.get(hid)
-            if not hsm:
-                print(f"[SKIP] {hid} not found in hsm_mapping.json")
-                continue
-            fw = hsm.get("fwVersion")
-            host = hsm.get("ipAddress") or hsm.get("host") or "<no-host>"
-            token = version_map.get(fw, "??")
-            user, pwd = gen_username(), gen_password()
-            print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
-            print(f" Would create user={user} pass={pwd} with role={os.path.splitext(args.role_file)[0]}")
-        print("=== END DRY RUN ===")
-        return
-    if args.test_ssh:
-        results = asyncio.run(run_all(args.hsm_ids, args.admin_user, admin_pass, args.role_file, args.insecure, test_ssh_only=True))
-        print("\nSSH TEST RESULTS:")
-        for r in results:
-            print(r)
-        return
-    results = asyncio.run(run_all(args.hsm_ids

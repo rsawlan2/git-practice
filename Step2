@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""
+Minimal Luna HSM SSH login via HSM ID + Webserver check.
+
+- Reads host/port from resources/hsm_mapping.json using --hsm-id
+- Prompts once for username + password
+- Connects via SSH
+- NEW: runs `webserver show` to check if webserver is enabled/disabled
+- Runs another test command (default: "hsm show")
+"""
+
+import sys, subprocess, importlib, getpass, json, os, socket
+
+# --- Ensure paramiko installed ---
+try:
+    import paramiko
+except ImportError:
+    print("[INFO] Installing paramiko...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko"])
+    import paramiko
+
+from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
+
+RES_DIR = "resources"
+HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+
+def load_hsm(hsm_id: str) -> dict:
+    if not os.path.exists(HSM_FILE):
+        raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
+    with open(HSM_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for h in data.get("hsms", []):
+        if h.get("id") == hsm_id:
+            return h
+    raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in {HSM_FILE}")
+
+def ssh_run(client: SSHClient, cmd: str, timeout: float = 10) -> tuple[str, str, int]:
+    """Run a command via an existing SSH connection and return (stdout, stderr, rc)."""
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    out = stdout.read().decode(errors="ignore")
+    err = stderr.read().decode(errors="ignore")
+    try:
+        rc = stdout.channel.recv_exit_status()
+    except Exception:
+        rc = -1
+    return out, err, rc
+
+# --- NEW CODE: helper to check webserver status ---
+def check_webserver_status(client):
+    """Run `webserver show` and parse output to return status string."""
+    out, err, rc = ssh_run(client, "webserver show")
+    combined = (out + err).lower()
+
+    if "running" in combined or "enabled" in combined:
+        return "ENABLED"
+    if "not running" in combined or "stopped" in combined or "disabled" in combined:
+        return "DISABLED"
+    if "permission denied" in combined:
+        return "NO_PERMISSION"
+    if "not recognized" in combined or "unknown command" in combined:
+        return "NOT_SUPPORTED"
+    return "UNKNOWN"
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--hsm-id", required=True, help="HSM ID from mapping JSON")
+    p.add_argument("--cmd", default="hsm show", help="Secondary LunaSH command to run")
+    args = p.parse_args()
+
+    hsm = load_hsm(args.hsm_id)
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+
+    user = input("Username: ").strip()
+    pwd = getpass.getpass("Password: ")
+
+    client = SSHClient()
+    client.set_missing_host_key_policy(AutoAddPolicy())
+
+    try:
+        print(f"[INFO] Connecting to {host}:{port} as {user} ...")
+        client.connect(
+            hostname=host,
+            port=port,
+            username=user,
+            password=pwd,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=20,
+        )
+    except AuthenticationException:
+        print("[ERROR] Authentication failed.")
+        return
+    except (SSHException, socket.error) as e:
+        print(f"[ERROR] SSH connection failed: {e}")
+        return
+
+    # --- NEW CODE: run webserver check here ---
+    status = check_webserver_status(client)
+    print(f"[WEB SERVER STATUS] {status}")
+
+    # Then run your secondary command (default: hsm show)
+    try:
+        out2, err2, rc2 = ssh_run(client, args.cmd)
+        print(f"\n--- Output of `{args.cmd}` ---")
+        print(out2)
+        if err2:
+            print("--- STDERR ---")
+            print(err2)
+        print(f"[INFO] `{args.cmd}` exited with code {rc2}")
+    except Exception as e:
+        print(f"[ERROR] Running `{args.cmd}` failed: {e}")
+
+    client.close()
+
+if __name__ == "__main__":
+    main()

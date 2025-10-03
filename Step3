@@ -5,23 +5,20 @@ luna_user_mgmt.py
 - Reads HSM mapping from resources/hsm_mapping.json
 - Single username/password prompt (used for SSH)
 - Connects via SSH to HSM
-- If --cmd is given, runs it; if not, just confirms successful connection
+- If --cmd is passed, runs it; if not, confirms successful connection
 - Always checks webserver status
 - Optional: upload/import custom role file (resources/roles/), create user, assign role,
-            and set temp password so user must change it at first login.
+            and attempt to set temporary password so user must change at first login.
 
-Usage examples:
-  # just test connection
-  python luna_user_mgmt.py --hsm-id hsma1
-
-  # run a command
-  python luna_user_mgmt.py --hsm-id hsma1 --cmd "user list"
-
-  # import role + create user
-  python luna_user_mgmt.py --hsm-id hsma1 --role-file user_mgmt_role.txt --new-user alice
+This version adds firmware-aware role import:
+ - For fw >= 7.8.0 uses:  user role import -roleName <role> -file <path>
+ - For older firmware uses: user role import <role> <path>
+ - If version is missing or the first attempt fails, the fallback syntax will be tried once.
 """
 
+from __future__ import annotations
 import os, sys, json, socket, time, getpass, argparse, secrets, string, base64, subprocess
+from typing import Tuple
 
 # Ensure paramiko installed
 try:
@@ -41,6 +38,33 @@ ROLES_DIR = os.path.join(RES_DIR, "roles")
 
 DEFAULT_REMOTE_ROLE_PATH = "/tmp/roledef.txt"
 SSH_TIMEOUT = 20.0
+
+
+# -------------------------
+# Version helper
+# -------------------------
+def parse_version_tuple(s: str) -> Tuple[int, ...]:
+    """Parse version strings like '7.8.0-1' -> (7,8,0). Non-numeric parts stripped."""
+    s = (s or "").split("-")[0].strip()
+    if not s:
+        return tuple()
+    parts = []
+    for p in s.split("."):
+        try:
+            parts.append(int(p))
+        except Exception:
+            parts.append(0)
+    return tuple(parts)
+
+
+def is_fw_at_least(fw: str, cmp_to: str = "7.8.0") -> bool:
+    """Return True if fw >= cmp_to (semantic-ish comparison)."""
+    if not fw:
+        return False
+    try:
+        return parse_version_tuple(fw) >= parse_version_tuple(cmp_to)
+    except Exception:
+        return False
 
 
 # -------------------------
@@ -109,7 +133,7 @@ def sh_escape(s: str) -> str:
 
 
 # -------------------------
-# Role/User helpers
+# Role/User helpers (firmware-aware import)
 # -------------------------
 def upload_role_file(client: SSHClient, local_file: str, remote_file: str = DEFAULT_REMOTE_ROLE_PATH) -> str:
     if not os.path.exists(local_file):
@@ -137,13 +161,46 @@ def upload_role_file(client: SSHClient, local_file: str, remote_file: str = DEFA
     return remote_file
 
 
-def import_role(client: SSHClient, role_name: str, remote_path: str) -> None:
-    cmd = f"user role import -roleName {role_name} -file {remote_path}"
-    out, err, rc = ssh_run(client, cmd)
-    combined = (out + err).lower()
-    if rc != 0 or "error" in combined or "syntax" in combined:
-        raise SystemExit(f"[ERROR] Role import failed: {out or err}")
-    print(f"[INFO] Role '{role_name}' imported successfully.")
+def import_role(client: SSHClient, hsm: dict, role_name: str, remote_path: str) -> None:
+    """
+    Firmware-aware import:
+      - If fwVersion >= 7.8.0 use: user role import -roleName <role> -file <path>
+      - Else use: user role import <role> <path>
+    If the chosen syntax fails, attempt the alternate syntax once as a fallback.
+    """
+    fw = hsm.get("fwVersion") or ""
+    use_new = is_fw_at_least(fw, "7.8.0")
+
+    tried = []
+    last_err = None
+
+    def _try(cmd: str) -> Tuple[bool, str]:
+        out, err, rc = ssh_run(client, cmd)
+        combined = (out + err).lower()
+        success = (rc == 0) and ("error" not in combined and "syntax" not in combined)
+        msg = out or err
+        return success, msg
+
+    # build candidate commands in preferred order
+    candidates = []
+    if use_new:
+        candidates.append(f"user role import -roleName {role_name} -file {remote_path}")
+        candidates.append(f"user role import {role_name} {remote_path}")
+    else:
+        candidates.append(f"user role import {role_name} {remote_path}")
+        candidates.append(f"user role import -roleName {role_name} -file {remote_path}")
+
+    for cmd in candidates:
+        tried.append(cmd)
+        success, msg = _try(cmd)
+        if success:
+            print(f"[INFO] Role '{role_name}' imported successfully using: {cmd}")
+            return
+        last_err = msg
+        print(f"[WARN] Role import attempt failed ({cmd}): {msg.strip()}")
+
+    # all attempts failed
+    raise SystemExit(f"[ERROR] Role import failed after trying syntaxes.\nTried: {tried}\nLast error: {last_err}")
 
 
 def add_user(client: SSHClient, username: str, password: str):
@@ -187,7 +244,7 @@ def force_password_set_interactive(client: SSHClient, username: str, password: s
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--hsm-id", required=True, help="HSM ID from mapping JSON")
-    p.add_argument("--cmd", help="LunaSH command to run (if omitted, just confirm connection)")
+    p.add_argument("--cmd", help="Optional LunaSH command to run (if omitted, just confirm connection)")
     p.add_argument("--role-file", help="Optional role filename inside resources/roles/")
     p.add_argument("--new-user", help="Optional new username to create (if omitted, will prompt)")
     args = p.parse_args()
@@ -228,15 +285,24 @@ def main():
         new_user = args.new_user or input("New username to create: ").strip()
         temp_pwd = gen_password()
 
+        print(f"[INFO] Uploading role file '{role_local_path}' ...")
         remote_role_path = upload_role_file(client, role_local_path)
-        import_role(client, role_name, remote_role_path)
+
+        print(f"[INFO] Importing role '{role_name}' (fwVersion={hsm.get('fwVersion')}) ...")
+        import_role(client, hsm, role_name, remote_role_path)
+
+        print(f"[INFO] Creating user '{new_user}' ...")
         add_user(client, new_user, temp_pwd)
+
+        print(f"[INFO] Assigning role '{role_name}' to '{new_user}' ...")
         assign_role(client, new_user, role_name)
+
+        print(f"[INFO] Attempting to set temporary password for '{new_user}' ...")
         force_password_set_interactive(client, new_user, temp_pwd)
 
         print("\n[RESULT] User created:", new_user)
         print("Temporary password:", temp_pwd)
-        print("User must change password at first login.")
+        print("User must change password at first login (firmware-dependent).")
 
     client.close()
 

@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""
+ssh_login.py
+
+Goal: Log in to Luna HSM over SSH using admin creds & HSM ID from user.
+"""
+
+import sys, subprocess, importlib, asyncio, json, getpass
+
+# Ensure deps
+for pkg in ("asyncssh",):
+    try: importlib.import_module(pkg)
+    except ImportError:
+        print(f"[INFO] Installing {pkg} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+import asyncssh
+
+# ----------------------------
+# Config
+# ----------------------------
+RES_DIR = "resources"
+HSM_FILE = f"{RES_DIR}/hsm_mapping.json"   # must have { "hsms": [ { "id": "...", "ipAddress": "...", "port":22 }, ... ] }
+
+# ----------------------------
+# Load HSM mapping
+# ----------------------------
+def load_hsms():
+    with open(HSM_FILE, "r") as f: return json.load(f).get("hsms", [])
+
+def find_hsm(hsms, hid):
+    for h in hsms:
+        if h.get("id") == hid:
+            return h
+    raise ValueError(f"HSM id {hid} not found in {HSM_FILE}")
+
+# ----------------------------
+# SSH connect (password only, PuTTY style)
+# ----------------------------
+async def connect_and_run(host, port, user, pwd, cmd="hsm show"):
+    args = {
+        "username": user,
+        "password": pwd,
+        "known_hosts": None,
+        "client_keys": None,
+        "allow_agent": False,
+        "look_for_keys": False,
+    }
+    print(f"[INFO] Connecting to {host}:{port} as {user} ...")
+    async with asyncssh.connect(host, port=port, **args) as conn:
+        result = await conn.run(cmd, check=False)
+        print(f"\n[OUTPUT from {cmd}]\n{result.stdout}\n{result.stderr}")
+        return result.exit_status
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--hsm-id", required=True, help="HSM ID from hsm_mapping.json")
+    p.add_argument("--admin-user", required=True, help="Admin username for SSH")
+    args = p.parse_args()
+
+    pwd = getpass.getpass("Admin password: ")
+    hsms = load_hsms()
+    hsm = find_hsm(hsms, args.hsm_id)
+
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+
+    rc = asyncio.run(connect_and_run(host, port, args.admin_user, pwd))
+    print(f"[INFO] SSH session finished with exit code {rc}")
+
+if __name__ == "__main__":
+    main()

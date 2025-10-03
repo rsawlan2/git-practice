@@ -1,194 +1,132 @@
 #!/usr/bin/env python3
-"""
-user_mgmt.py
+# luna_rest_upload_test.py
+# Tries several REST upload endpoints/field names against a Luna HSM webserver and prints results.
+# Usage: python luna_rest_upload_test.py
+# Make sure user_mgmt_role.txt is in cwd (or edit FILE_PATH variable).
 
-Single-credential version:
- - One username/password is used for BOTH SSH (LunaSH) and REST API.
- - No double prompts.
- - Webserver check fixed.
-"""
+import requests, getpass, os, sys, json
+from requests.auth import HTTPBasicAuth
 
-import sys, subprocess, importlib, os, json, asyncio, secrets, string, random, getpass, base64, time, shlex
+# CONFIG: change if needed
+HOST = "10.24.128.69"
+PORT = 8443       # detected from webserver show
+USERNAME = input("Admin username (e.g. admin): ").strip() or "admin"
+PASSWORD = getpass.getpass(f"Password for {USERNAME}@{HOST}: ")
+FILE_PATH = "user_mgmt_role.txt"
 
-# ----------------------------
-# Bootstrap dependencies
-# ----------------------------
-REQUIRED = ("asyncssh", "portalocker", "requests")
-for pkg in REQUIRED:
+if not os.path.exists(FILE_PATH):
+    print(f"[ERROR] Local file not found: {FILE_PATH}")
+    print("Run from the directory that contains the role file, or edit FILE_PATH in this script.")
+    sys.exit(2)
+
+base = f"https://{HOST}:{PORT}"
+sess = requests.Session()
+sess.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+sess.verify = False  # self-signed certs common on appliances
+
+def show_root():
     try:
-        importlib.import_module(pkg)
-    except Exception:
-        print(f"[INFO] Installing missing package: {pkg}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-import asyncssh, portalocker, requests
-
-# ----------------------------
-# Config
-# ----------------------------
-RES_DIR = "resources"
-HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
-VERSION_FILE = os.path.join(RES_DIR, "version_map.json")
-ROLES_DIR = os.path.join(RES_DIR, "roles")
-FAILED_LOG = os.path.join(RES_DIR, "failed_jobs.jsonl")
-DEFAULT_ROLE_FILE = "user_mgmt_role.txt"
-DEFAULT_REST_PORT = 8443
-
-SSH_RETRIES = 3
-BACKOFF_BASE = 0.5
-BACKOFF_FACTOR = 2.0
-BACKOFF_JITTER = 0.2
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def load_json(path): return json.load(open(path, "r"))
-
-def check_fw_version(v, cmp_to="7.8.0"):
-    if not v: return False
-    def parse(s): return tuple(int(x) for x in s.split("-")[0].split("."))
-    return parse(v) >= parse(cmp_to)
-
-def gen_username(): return "usermgmt_" + secrets.token_hex(3)
-
-def gen_password(length=16):
-    chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
-    while True:
-        p = ''.join(secrets.choice(chars) for _ in range(length))
-        if (any(c.islower() for c in p) and any(c.isupper() for c in p)
-                and any(c.isdigit() for c in p) and any(c in "!@#$%^&*()-_=+" for c in p)):
-            return p
-
-async def backoff_sleep(attempt):
-    base = BACKOFF_BASE * (BACKOFF_FACTOR ** (attempt-1))
-    jitter = random.uniform(-BACKOFF_JITTER, BACKOFF_JITTER)
-    await asyncio.sleep(max(0, base+jitter))
-
-def write_failed(entry):
-    os.makedirs(os.path.dirname(FAILED_LOG), exist_ok=True)
-    with portalocker.Lock(FAILED_LOG, "a", timeout=5) as fh:
-        fh.write(json.dumps(entry)+"\n")
-
-def get_content_type_token(version_map, fw_version):
-    token = version_map.get(fw_version)
-    if not token:
-        raise KeyError(f"Firmware {fw_version} not in {VERSION_FILE}")
-    return token
-
-# ----------------------------
-# SSH helpers
-# ----------------------------
-async def connect_password(host, port, username, password, timeout=20):
-    args = {
-        "username": username,
-        "password": password,
-        "known_hosts": None,
-        "client_keys": None,
-        "allow_agent": False,
-        "look_for_keys": False,
-    }
-    return await asyncio.wait_for(asyncssh.connect(host, port=port, **args), timeout=timeout)
-
-async def run_with_pty(conn, cmd, prompt="lunash>", timeout=20, input_text=None):
-    proc = await conn.create_process(term_type="xterm")
-    try:
-        if input_text:
-            proc.stdin.write(input_text.encode() if isinstance(input_text, str) else input_text)
-            await proc.stdin.drain()
-        proc.stdin.write((cmd+"\n").encode()); await proc.stdin.drain()
-        out, start = "", time.time()
-        while True:
-            try: chunk = await asyncio.wait_for(proc.stdout.read(1024), timeout=2)
-            except asyncio.TimeoutError: chunk=b""
-            if chunk: 
-                out += chunk.decode(errors="ignore")
-                if prompt.lower() in out.lower(): break
-            if time.time()-start > timeout: break
-        return out, await proc.stderr.read(), getattr(proc,"exit_status",None)
-    finally:
-        proc.close()
-
-# ----------------------------
-# Webserver check
-# ----------------------------
-async def lunash_check_webserver(hsm, user, pwd):
-    host = hsm.get("ipAddress") or hsm.get("host")
-    port = int(hsm.get("port",22))
-    try:
-        conn = await connect_password(host, port, user, pwd)
-        async with conn:
-            out, err, _ = await run_with_pty(conn, "webserver show")
-            return "running" in (out+err).lower()
+        r = sess.get(base + "/", timeout=10)
+        print(f"[GET /] {r.status_code} {r.reason}")
+        # print small snippet
+        print(r.text[:800])
     except Exception as e:
-        print(f"[{hsm.get('id')}] webserver check error: {e}")
-        return False
+        print("[GET /] ERROR:", e)
 
-# ----------------------------
-# REST helpers (requests)
-# ----------------------------
-def build_rest_session(base_url, user, pwd, ct, insecure):
-    sess = requests.Session(); sess.verify=not insecure; sess.headers.update({"Content-Type": ct})
-    r = sess.post(base_url.rstrip("/")+"/auth/session", auth=(user,pwd), timeout=20)
-    if r.status_code>=300: raise RuntimeError(f"REST login failed: {r.status_code} {r.text[:200]}")
-    sid = r.cookies.get("SESSION_ID") or r.headers.get("Set-Cookie","").split("SESSION_ID=")[-1].split(";")[0].strip()
-    if not sid: raise RuntimeError("No SESSION_ID returned")
-    sess.cookies.set("SESSION_ID", sid); return sess
+def list_users():
+    urls = [f"{base}/api/users", f"{base}/users"]
+    for u in urls:
+        try:
+            r = sess.get(u, timeout=15)
+            print(f"[GET {u}] {r.status_code}")
+            ct = r.headers.get("Content-Type","")
+            print("  Content-Type:", ct)
+            txt = r.text
+            snippet = txt[:1500].strip()
+            print("  Body snippet:", snippet[:500].replace("\n"," ") + ("..." if len(snippet)>500 else ""))
+            # try to parse json
+            try:
+                j = r.json()
+                # show first few user entries if list/dict
+                if isinstance(j, list):
+                    print("  Found user list length:", len(j))
+                    for e in j[:8]:
+                        print("   -", {k: e.get(k) for k in ("id","username","name","login") if k in e})
+                elif isinstance(j, dict):
+                    # maybe paged response with data
+                    if "data" in j and isinstance(j["data"], list):
+                        print("  Paged users, data length:", len(j["data"]))
+                        for e in j["data"][:8]:
+                            print("   -", {k: e.get(k) for k in ("id","username","name","login") if k in e})
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[GET {u}] ERROR: {e}")
 
-def rest_create_role(sess, base_url, role): return sess.post(base_url+"/roles", json={"roleId":role}).status_code
-def rest_put_rolefile(sess, base_url, role, path, ct_file): return sess.put(f"{base_url}/roles/{role}/resources", data=open(path,"rb").read(), headers={"Content-Type":ct_file}).status_code
-def rest_create_user(sess, base_url, user, pwd, role): return sess.post(base_url+"/users", json={"userId":user,"role":role,"password":pwd}).status_code
-def rest_get_users(sess, base_url): r=sess.get(base_url+"/users"); return r.status_code,r.text
-
-# ----------------------------
-# Orchestration
-# ----------------------------
-async def process_hsm(hsm, user, pwd, role_file, version_map, insecure, skip_webserver=False):
-    hid, fw = hsm.get("id"), hsm.get("fwVersion")
-    host = hsm.get("ipAddress") or hsm.get("host")
-    token = get_content_type_token(version_map, fw)
-    ct_json=f"application/vnd.safenetinc.lunasa+json;version={token}"
-    ct_file=f"application/vnd.safenetinc.lunasa+file;version={token}"
-    print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
-
-    if not skip_webserver and not await lunash_check_webserver(hsm,user,pwd):
-        return {"hsm":hid,"status":"FAILED","error":"webserver not running"}
-
-    new_user,new_pwd=gen_username(),gen_password()
-    base=hsm.get("rest_url") or f"https://{host}:{DEFAULT_REST_PORT}"
+def try_upload(target_url, form_field):
+    print(f"\n[TRY] POST {target_url} using field '{form_field}'")
     try:
-        sess=build_rest_session(base,user,pwd,ct_json,insecure)
-        role=os.path.splitext(role_file)[0]
-        if rest_create_role(sess,base,role) not in (200,201,204,409): raise RuntimeError("role create fail")
-        role_path=os.path.join(ROLES_DIR,role_file)
-        if rest_put_rolefile(sess,base,role,role_path,ct_file) not in (200,201,204): raise RuntimeError("role upload fail")
-        if rest_create_user(sess,base,new_user,new_pwd,role) not in (200,201,204): raise RuntimeError("user create fail")
-        code,body=rest_get_users(sess,base)
-        if new_user not in body: return {"hsm":hid,"status":"WARN","user":new_user,"password":new_pwd}
+        with open(FILE_PATH, "rb") as f:
+            files = {form_field: (os.path.basename(FILE_PATH), f)}
+            r = sess.post(target_url, files=files, timeout=30)
     except Exception as e:
-        return {"hsm":hid,"status":"FAILED","error":str(e)}
-
-    return {"hsm":hid,"status":"OK","user":new_user,"password":new_pwd}
-
-# ----------------------------
-# Runner
-# ----------------------------
-async def run_all(hsm_ids,user,pwd,role_file,insecure,skip_webserver):
-    hsms=load_json(HSM_FILE).get("hsms",[]); vm=load_json(VERSION_FILE)
-    lookup={h["id"]:h for h in hsms}
-    return await asyncio.gather(*[process_hsm(lookup[hid],user,pwd,role_file,vm,insecure,skip_webserver) for hid in hsm_ids if hid in lookup])
+        print("  Request failed:", e)
+        return
+    print("  Status:", r.status_code)
+    print("  Content-Type:", r.headers.get("Content-Type"))
+    body = r.text or ""
+    print("  Body (snippet):")
+    print("  ", body[:1500].replace("\n"," ") + ("..." if len(body)>1500 else ""))
 
 def main():
-    import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument("--hsm-ids",nargs="+",required=True)
-    p.add_argument("--user",required=True,help="Username (used for both SSH and REST)")
-    p.add_argument("--role-file",default=DEFAULT_ROLE_FILE)
-    p.add_argument("--insecure",action="store_true")
-    p.add_argument("--skip-webserver",action="store_true")
-    args=p.parse_args()
-    pwd=getpass.getpass("Password (used for both SSH and REST): ")
-    results=asyncio.run(run_all(args.hsm_ids,args.user,pwd,args.role_file,args.insecure,args.skip_webserver))
-    print("\nRESULTS:")
-    for r in results: print(r)
+    print("[INFO] Server root:")
+    show_root()
 
-if __name__=="__main__": main()
+    print("\n[INFO] Attempting to list users (to detect numeric id vs username path):")
+    list_users()
+
+    # candidate endpoints: username path, numeric id (later), alternate roots
+    candidate_endpoints = [
+        f"{base}/api/users/{USERNAME}/files",
+        f"{base}/users/{USERNAME}/files",
+        f"{base}/api/users/{USERNAME}/roles/files",
+        f"{base}/users/{USERNAME}/files",
+    ]
+
+    # candidate form field names to try
+    fields = ["file", "uploadFile", "roleFile", "filedata", "fileToUpload"]
+
+    for endpoint in candidate_endpoints:
+        for fld in fields:
+            try_upload(endpoint, fld)
+
+    # If the /api/users returned numeric ids, try those too (attempt to parse)
+    try:
+        r = sess.get(f"{base}/api/users", timeout=15)
+        js = r.json() if r.ok else None
+        ids = []
+        if isinstance(js, list):
+            for u in js:
+                uid = u.get("id") or u.get("userId") or u.get("uid")
+                uname = u.get("username") or u.get("name") or u.get("login")
+                if uid and uname:
+                    ids.append((uid, uname))
+        elif isinstance(js, dict) and "data" in js and isinstance(js["data"], list):
+            for u in js["data"]:
+                uid = u.get("id") or u.get("userId")
+                uname = u.get("username") or u.get("name")
+                if uid and uname:
+                    ids.append((uid, uname))
+        if ids:
+            print("\n[INFO] Trying numeric-id upload endpoints discovered from /api/users:")
+            for uid, uname in ids[:8]:
+                ep = f"{base}/api/users/{uid}/files"
+                for fld in fields:
+                    try_upload(ep, fld)
+        else:
+            print("\n[INFO] No numeric ids parsed from /api/users (or /api/users not accessible).")
+    except Exception as e:
+        print("[INFO] Could not parse /api/users JSON:", e)
+
+if __name__ == "__main__":
+    main()

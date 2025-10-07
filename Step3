@@ -1,32 +1,20 @@
 #!/usr/bin/env python3
 """
-luna_create_user_mgmt_role_and_user.py
+Minimal Luna HSM SSH login via HSM ID + Webserver check.
 
-Minimal, version-aware script that:
-- Loads HSM mapping via --hsm-id (resources/hsm_mapping.json)
-- Connects via SSH (prompts for admin username + password)
-- Checks webserver status
-- Creates a minimal user-management role file (user_mgmt), uploads it (SFTP; fallback to scp), imports it
-- Prints confirmation that the custom role for user management was created
-- Prompts operator for the new username, generates a temporary password, creates the user and sets the temp password
-- Attempts to force change-on-first-login depending on firmware version (best-effort)
-- Assigns the `user_mgmt` role to the new user and confirms assignment
-
-Requires: paramiko (auto-installs if missing)
+- Reads host/port from resources/hsm_mapping.json using --hsm-id
+- Prompts once for admin username + password
+- Connects via SSH
+- Runs `webserver show` to check if webserver is enabled/disabled
+- INTERACTIVE: prompts admin whether to create a new LunaSH user; if yes, prompts for
+  username and role, generates a temp password, creates the user, assigns the role,
+  and saves the temp password (overwritten each run) to resources/user_passwords.json
+- Then verifies HSM connectivity by running `hsm show` silently and prints only success message
 """
-from __future__ import annotations
-import sys
-import subprocess
-import getpass
-import json
-import os
-import socket
-import time
-import secrets
-import string
-import re
 
-# ensure paramiko
+import sys, subprocess, getpass, json, os, socket, secrets, string, datetime
+
+# --- Ensure paramiko installed ---
 try:
     import paramiko
 except ImportError:
@@ -36,32 +24,12 @@ except ImportError:
 
 from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
 
-# resources mapping file
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 
-# fixed role name and role file
-ROLE_NAME = "user_mgmt"
-ROLE_FILENAME = "user_mgmt_role.txt"
-ROLE_CONTENT_LINES = [
-    "user list",
-    "user show",
-    "user add",
-    "user delete",
-    "user enable",
-    "user disable",
-    "user role add",
-    "user role remove",
-    "user role list",
-    "user role show",
-]
+os.makedirs(RES_DIR, exist_ok=True)
 
-# timeouts
-SSH_CONNECT_TIMEOUT = 20
-LUNASH_CMD_TIMEOUT = 30
-INTERACTIVE_TIMEOUT = 60
-
-# ---------------- Helpers ----------------
 def load_hsm(hsm_id: str) -> dict:
     if not os.path.exists(HSM_FILE):
         raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
@@ -72,8 +40,14 @@ def load_hsm(hsm_id: str) -> dict:
             return h
     raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in {HSM_FILE}")
 
-def ssh_run(client: SSHClient, cmd: str, timeout: float = 15) -> tuple[str, str, int]:
+def ssh_run(client: SSHClient, cmd: str, timeout: float = 10, input_text: str = None) -> tuple[str, str, int]:
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    if input_text is not None:
+        try:
+            stdin.write(input_text)
+            stdin.flush()
+        except Exception:
+            pass
     out = stdout.read().decode(errors="ignore")
     err = stderr.read().decode(errors="ignore")
     try:
@@ -82,7 +56,7 @@ def ssh_run(client: SSHClient, cmd: str, timeout: float = 15) -> tuple[str, str,
         rc = -1
     return out, err, rc
 
-def check_webserver_status(client: SSHClient) -> str:
+def check_webserver_status(client):
     out, err, rc = ssh_run(client, "webserver show")
     combined = (out + err).lower()
     if "running" in combined or "enabled" in combined:
@@ -95,141 +69,100 @@ def check_webserver_status(client: SSHClient) -> str:
         return "NOT_SUPPORTED"
     return "UNKNOWN"
 
-def write_role_file(path=ROLE_FILENAME):
-    with open(path, "w", newline="\n") as f:
-        for line in ROLE_CONTENT_LINES:
-            f.write(line.rstrip() + "\n")
-    return path
-
-def assert_unix_lf(path):
-    with open(path, "rb") as f:
-        data = f.read()
-    if b"\r\n" in data:
-        raise SystemExit("Role file contains CRLF. Convert to UNIX LF (dos2unix) and retry.")
-    if not data.strip():
-        raise SystemExit("Role file is empty.")
-
-def sftp_upload(client: SSHClient, local_path: str) -> str:
-    """Attempt to upload via SFTP. May raise exceptions if SFTP not supported."""
-    sftp = client.open_sftp()
-    remote_name = os.path.basename(local_path)
-    sftp.put(local_path, remote_name)
-    sftp.close()
-    return remote_name
-
-def scp_upload(local_path: str, admin_user: str, host: str, port: int, remote_name: str) -> bool:
-    """
-    Fallback: use system scp. This will prompt for password if needed.
-    Returns True on success (rc == 0). Caller should handle prompting behavior.
-    """
-    scp_target = f"{admin_user}@{host}:{remote_name}"
-    scp_cmd = ["scp", "-P", str(port), local_path, scp_target]
-    print(f"[INFO] Attempting scp fallback: {' '.join(scp_cmd)}")
-    try:
-        rc = subprocess.run(scp_cmd).returncode
-        return rc == 0
-    except FileNotFoundError:
-        print("[ERROR] scp not found on this host. Install OpenSSH client or upload the file manually.")
-        return False
-
-def run_lunash_cmd(client: SSHClient, cmd: str, timeout: int = LUNASH_CMD_TIMEOUT):
-    full = f'lunash -c "{cmd}"'
-    out, err, rc = ssh_run(client, full, timeout=timeout)
-    return rc, out.strip(), err.strip()
-
-def parse_firmware_version_from_hsm_show(client: SSHClient):
-    rc, out, err = run_lunash_cmd(client, "hsm show")
-    text = (out + "\n" + err)
-    if not text.strip():
-        return None
-    m = re.search(r"firmware\s+version[:\s]*([0-9]+)\.([0-9]+)\.([0-9]+)", text, flags=re.I)
-    if not m:
-        m = re.search(r"version[:\s]*([0-9]+)\.([0-9]+)\.([0-9]+)", text, flags=re.I)
-    if m:
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    return None
-
-def gen_temp_password(length=14):
+def _generate_temp_password(length: int = 20) -> str:
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def user_add_interactive_then_password(client: SSHClient, username: str, password: str, timeout=INTERACTIVE_TIMEOUT):
-    """
-    Run lunash interactive, do: user add -username <username> (send password prompts),
-    then user password <username> (send password prompts). Return combined output.
-    """
-    chan = client.invoke_shell()
-    time.sleep(0.35)
-    chan.send("lunash\n")
-    time.sleep(0.2)
-    combined = ""
-
-    # user add
-    chan.send(f"user add -username {username}\n")
-    start = time.time()
-    buf = ""
-    saw_new = saw_retype = False
-    while time.time() - start < timeout:
-        if chan.recv_ready():
-            chunk = chan.recv(4096).decode(errors="ignore")
-            buf += chunk
-            low = chunk.lower()
-            if ("new password" in low or "enter new password" in low or "new passwd" in low) and not saw_new:
-                chan.send(password + "\n"); saw_new = True
-            if ("retype new password" in low or "confirm new password" in low) and not saw_retype:
-                chan.send(password + "\n"); saw_retype = True
-            if "created" in buf.lower() or "all authentication tokens updated successfully" in buf.lower():
-                break
-        time.sleep(0.12)
-    combined += "\n--- after user add ---\n" + buf
-
-    # user password
-    chan.send(f"user password {username}\n")
-    start2 = time.time()
-    buf2 = ""
-    saw_new2 = saw_retype2 = False
-    while time.time() - start2 < timeout:
-        if chan.recv_ready():
-            chunk = chan.recv(4096).decode(errors="ignore")
-            buf2 += chunk
-            low = chunk.lower()
-            if ("new password" in low or "enter new password" in low) and not saw_new2:
-                chan.send(password + "\n"); saw_new2 = True
-            if ("retype new password" in low or "confirm new password" in low) and not saw_retype2:
-                chan.send(password + "\n"); saw_retype2 = True
-            if "all authentication tokens updated successfully" in buf2.lower() or "changing password" in buf2.lower():
-                break
-        time.sleep(0.12)
-    combined += "\n--- after user password ---\n" + buf2
-
+def _save_password_for_user(username: str, password: str) -> None:
+    data = {}
+    if os.path.exists(PW_STORE):
+        try:
+            with open(PW_STORE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data[username] = {
+        "password": password,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z"
+    }
+    tmp = PW_STORE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, PW_STORE)
     try:
-        chan.send("exit\n")
+        os.chmod(PW_STORE, 0o600)
     except Exception:
-        pass
-    return combined
+        print(f"[WARN] Could not set file permissions on {PW_STORE}. Secure it manually.")
 
-# ---------------- Main ----------------
+def prompt_new_user_and_role() -> tuple[str, str]:
+    while True:
+        new_user = input("Enter the new username to create: ").strip()
+        if new_user:
+            break
+        print("[ERROR] username cannot be empty.")
+    while True:
+        new_role = input(f"Enter role to assign to '{new_user}': ").strip()
+        if new_role:
+            break
+        print("[ERROR] role cannot be empty.")
+    return new_user, new_role
+
+def create_lunash_user_and_store_password(client: SSHClient, username: str, role: str) -> bool:
+    print(f"[INFO] Creating LunaSH user '{username}' with role '{role}' ...")
+    temp_pw = _generate_temp_password(20)
+    stdin_payload = f"{temp_pw}\n{temp_pw}\n"
+    cmd_add = f"user add -username {username}"
+    out, err, rc = ssh_run(client, cmd_add, timeout=60, input_text=stdin_payload)
+    combined = (out + err).lower()
+    if rc != 0:
+        print(f"[ERROR] Creating user '{username}' failed (rc={rc}).")
+        if "permission denied" in combined or "not authorized" in combined:
+            print("[ERROR] Permission denied — need admin privileges to create users.")
+        return False
+    print(f"[INFO] user '{username}' created. Now assigning role '{role}' ...")
+    cmd_role = f"user role add -username {username} -role {role}"
+    out2, err2, rc2 = ssh_run(client, cmd_role, timeout=30)
+    combined2 = (out2 + err2).lower()
+    if rc2 != 0:
+        print(f"[ERROR] Assigning role '{role}' to '{username}' failed (rc={rc2}).")
+        if "permission denied" in combined2 or "not authorized" in combined2:
+            print("[ERROR] Permission denied — cannot assign role.")
+        return False
+    try:
+        _save_password_for_user(username, temp_pw)
+        print(f"[INFO] Temporary password saved to: {PW_STORE} (overwritten for user '{username}').")
+        print("[INFO] Password is NOT printed to console for security.")
+    except Exception as e:
+        print(f"[WARN] Could not save password to {PW_STORE}: {e}")
+    return True
+
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="Create user_mgmt role + create user and assign role (minimal).")
+    p = argparse.ArgumentParser()
     p.add_argument("--hsm-id", required=True, help="HSM ID from mapping JSON")
-    p.add_argument("--cmd", default="hsm show", help="Optional secondary command to run at end")
     args = p.parse_args()
 
-    # load mapping
     hsm = load_hsm(args.hsm_id)
     host = hsm.get("ipAddress") or hsm.get("host")
     port = int(hsm.get("port", 22))
 
-    # admin creds
-    admin_user = input("Admin SSH username: ").strip()
-    admin_pass = getpass.getpass("Admin SSH password: ")
+    admin_user = input("Username: ").strip()
+    admin_pwd = getpass.getpass("Password: ")
 
     client = SSHClient()
     client.set_missing_host_key_policy(AutoAddPolicy())
+
     try:
         print(f"[INFO] Connecting to {host}:{port} as {admin_user} ...")
-        client.connect(hostname=host, port=port, username=admin_user, password=admin_pass, allow_agent=False, look_for_keys=False, timeout=SSH_CONNECT_TIMEOUT)
+        client.connect(
+            hostname=host,
+            port=port,
+            username=admin_user,
+            password=admin_pwd,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=20,
+        )
     except AuthenticationException:
         print("[ERROR] Authentication failed.")
         return
@@ -237,134 +170,29 @@ def main():
         print(f"[ERROR] SSH connection failed: {e}")
         return
 
-    # webserver check
-    ws = check_webserver_status(client)
-    print(f"[WEB SERVER STATUS] {ws}")
+    status = check_webserver_status(client)
+    print(f"[WEB SERVER STATUS] {status}")
 
-    # write role file
-    try:
-        role_path = write_role_file()
-        assert_unix_lf(role_path)
-        print(f"[INFO] Role file created locally: {role_path}")
-    except Exception as e:
-        print(f"[ERROR] Creating role file failed: {e}")
-        client.close()
-        return
-
-    # attempt SFTP upload first
-    remote_name = os.path.basename(role_path)
-    uploaded = False
-    try:
-        remote_name = sftp_upload(client, role_path)
-        print(f"[INFO] Uploaded role file via SFTP as: {remote_name}")
-        uploaded = True
-    except Exception as e:
-        print(f"[ERROR] SFTP upload failed: {e}")
-        # try scp fallback
-        print("[INFO] Attempting scp fallback (you may be prompted for admin password)...")
-        ok = scp_upload(role_path, admin_user, host, port, remote_name)
-        if ok:
-            print("[INFO] scp upload succeeded.")
-            uploaded = True
-        else:
-            print("[ERROR] Both SFTP and scp upload failed. Upload the role file manually to the appliance and re-run.")
-            client.close()
-            return
-
-    # import role
-    print(f"[INFO] Importing role '{ROLE_NAME}' ...")
-    rc, out, err = run_lunash_cmd(client, f"user role import -file {remote_name} -role {ROLE_NAME}")
-    print(f"[IMPORT] rc={rc}")
-    if out:
-        print("[IMPORT OUT]", out)
-    if err:
-        print("[IMPORT ERR]", err)
-    if rc != 0:
-        print("[ERROR] Role import failed. Aborting.")
-        client.close()
-        return
-
-    print(f"[OK] Custom role '{ROLE_NAME}' for user management created.")
-
-    # prompt for username to create & assign
-    new_user = input("Enter username to create and assign to role 'user_mgmt': ").strip()
-    if not new_user:
-        print("[ERROR] No username provided. Exiting.")
-        client.close()
-        return
-
-    # detect firmware version (best-effort)
-    ver = parse_firmware_version_from_hsm_show(client)
-    if ver:
-        print(f"[INFO] Detected firmware version: {ver[0]}.{ver[1]}.{ver[2]}")
+    answer = input("Create new user now? (y/N): ").strip().lower()
+    if answer == "y":
+        new_user, new_role = prompt_new_user_and_role()
+        ok = create_lunash_user_and_store_password(client, new_user, new_role)
+        if not ok:
+            print("[WARN] create-user flow reported failure; continuing with HSM check.")
     else:
-        print("[WARN] Could not parse firmware version; expiry behavior may be uncertain.")
+        print("[INFO] Skipping user creation.")
 
-    # generate temp password (print once)
-    temp_pw = gen_temp_password(14)
-    print(f"[INFO] Generated temporary password for '{new_user}':\n{temp_pw}\n--- Save and share securely; user will be forced to change it on first login if expiry applied. ---")
-
-    # create user and attempt expiry according to firmware heuristics
+    # Run 'hsm show' silently and print success message instead of full output
     try:
-        if ver and (ver[0], ver[1], ver[2]) <= (7,4,0):
-            print("[INFO] Older firmware detected (<=7.4). Using user add + user password to expire.")
-            combined = user_add_interactive_then_password(client, new_user, temp_pw, timeout=INTERACTIVE_TIMEOUT)
-            print("[USER CREATE OUTPUT SNIPPET]")
-            print("\n".join(combined.splitlines()[-20:]))
+        _, _, rc2 = ssh_run(client, "hsm show")
+        if rc2 == 0:
+            print("[INFO] Connected and HSM is running successfully.")
         else:
-            # newer or unknown: attempt same sequence and inspect output; warn if cannot confirm expiry
-            print("[INFO] Newer/unknown firmware: attempting user add + user password and detecting expiry.")
-            combined = user_add_interactive_then_password(client, new_user, temp_pw, timeout=INTERACTIVE_TIMEOUT)
-            print("[USER CREATE OUTPUT SNIPPET]")
-            print("\n".join(combined.splitlines()[-20:]))
-            low = combined.lower()
-            if "must change" in low or "must change password" in low or "expire" in low or "all authentication tokens updated successfully" in low:
-                print("[INFO] Detected indication that password will require change at first login.")
-            else:
-                print("[WARN] Could not confirm force-change-on-first-login for this firmware.")
-                print("If you need to guarantee expiry, run appropriate per-version commands manually (see Thales docs).")
+            print("[WARN] Connected but HSM show returned non-zero exit code.")
     except Exception as e:
-        print(f"[ERROR] Creating user / setting password failed: {e}")
-        client.close()
-        return
-
-    # assign role
-    print(f"[INFO] Assigning role '{ROLE_NAME}' to user '{new_user}' ...")
-    rc2, out2, err2 = run_lunash_cmd(client, f"user role add -username {new_user} -role {ROLE_NAME}")
-    print(f"[ROLE ADD] rc={rc2}")
-    if out2: print("[ROLE ADD OUT]", out2)
-    if err2: print("[ROLE ADD ERR]", err2)
-    if rc2 != 0:
-        print("[ERROR] Role assignment failed.")
-        client.close()
-        return
-
-    print(f"[OK] User '{new_user}' assigned to role '{ROLE_NAME}'.")
-
-    # quick verification: list roles for user
-    rcv, outv, errv = run_lunash_cmd(client, f"user role list -username {new_user}")
-    print("\n--- Verification: user role list ---")
-    if outv:
-        print(outv)
-    elif errv:
-        print(errv)
-    else:
-        print(f"[INFO] Command returned rc={rcv} with no output.")
-
-    # optional final cmd
-    try:
-        out3, err3, rc3 = ssh_run(client, args.cmd)
-        print(f"\n--- Output of `{args.cmd}` ---")
-        print(out3)
-        if err3:
-            print("--- STDERR ---")
-            print(err3)
-        print(f"[INFO] `{args.cmd}` exited with code {rc3}")
-    except Exception as e:
-        print(f"[ERROR] Running `{args.cmd}` failed: {e}")
+        print(f"[ERROR] Could not verify HSM status: {e}")
 
     client.close()
-    print("Done — role created, user created (temp pw set), and user assigned to user_mgmt. ✅")
 
 if __name__ == "__main__":
     main()

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Luna HSM User Creation and Role Import Script (Version-Aware, SCP-based)
+Luna HSM User Creation + Role Import (Version-Aware, SCP-based)
 
-Purpose:
-    Automates creation of a LunaSH user-management role and user on a Luna Network HSM.
+Automates creation of a LunaSH user and imports a version-appropriate role file.
 
-Key Features:
-    • Reads HSM connection details from resources/hsm_mapping.json
-    • Prompts for admin credentials
-    • Connects via SSH
-    • Detects Luna firmware version and maps it to the correct role command set
-    • Generates an appropriate role file (in /tmp) and uploads it via scp -O
-    • Imports the role and assigns it to the created user
-    • Leaves the uploaded role file on the HSM for reference
-    • Displays a clear summary of detected version and actions performed
+Features:
+    • Reads HSM details from resources/hsm_mapping.json
+    • Connects via SSH using admin credentials
+    • Detects Luna firmware version and maps to appropriate command set
+    • Generates user-management role file and uploads via scp -O
+    • Imports role and assigns it to the created user
+    • Leaves role file on HSM (for audit/reference)
 """
 
 import argparse
@@ -26,10 +23,11 @@ import subprocess
 import getpass
 import socket
 import re
+import tempfile
 from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
 
 # ----------------------------------------------------------------------
-# Constants and file paths
+# Constants and resource paths
 # ----------------------------------------------------------------------
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
@@ -37,28 +35,23 @@ PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 os.makedirs(RES_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------
-# Role command definitions per firmware group
+# Role definitions per Luna firmware family
 # ----------------------------------------------------------------------
-# These sets are derived from official Thales documentation.
-# Each minor version range shares identical user-management command behavior.
-#
-# Group 7.3 → covers 7.3, 7.4, 7.5, 7.6
-# Group 7.7 → covers 7.7, 7.8
-# Group 7.9 → covers 7.9, 7.10, 7.11, and 8.x (future-compatible)
-#
-# Fallback → used only if firmware version cannot be detected.
 ROLE_DEFINITIONS = {
+    # Luna 7.3.x → legacy syntax (role clear supported)
     "7.3": [
         "user list", "user add", "user delete", "user enable", "user disable",
         "user password", "user role add", "user role delete",
         "user role clear", "user role list", "user role import"
     ],
+    # Luna 7.7.x → RADIUS introduced, role clear dropped
     "7.7": [
         "user list", "user add", "user delete", "user enable", "user disable",
         "user password", "user radiusAdd",
         "user role add", "user role delete",
         "user role list", "user role import"
     ],
+    # Luna 7.9.x+ → RADIUS add/delete, REST alignment
     "7.9": [
         "user list", "user add", "user delete", "user enable", "user disable",
         "user password", "user radiusAdd", "user radiusDelete",
@@ -67,16 +60,17 @@ ROLE_DEFINITIONS = {
     ]
 }
 
+# Fallback (used only if version cannot be detected)
 FALLBACK_ROLE = [
     "user list", "user add", "user delete", "user password",
     "user role list", "user role import"
 ]
 
 # ----------------------------------------------------------------------
-# Utility helpers
+# Helper utilities
 # ----------------------------------------------------------------------
 def ssh_run(client, cmd, timeout=10, input_text=None):
-    """Execute a command on the HSM over SSH and return (stdout, stderr, exit_code)."""
+    """Execute a LunaSH command over SSH and return stdout, stderr, and exit code."""
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     if input_text:
         stdin.write(input_text)
@@ -85,8 +79,9 @@ def ssh_run(client, cmd, timeout=10, input_text=None):
     rc = stdout.channel.recv_exit_status()
     return out, err, rc
 
+
 def load_hsm(hsm_id):
-    """Load HSM connection details (host, port) from JSON mapping file."""
+    """Load HSM connection details from mapping JSON."""
     if not os.path.exists(HSM_FILE):
         raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
     with open(HSM_FILE, "r", encoding="utf-8") as f:
@@ -96,13 +91,15 @@ def load_hsm(hsm_id):
             return h
     raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in mapping.")
 
+
 def _generate_temp_password(length=16):
-    """Generate a secure random temporary password for the new user."""
+    """Generate a random temporary password."""
     alphabet = string.ascii_letters + string.digits + "._-"
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
+
 def _save_password_for_user(username, password):
-    """Persist generated passwords locally in resources/user_passwords.json."""
+    """Store temporary user password locally."""
     data = {}
     if os.path.exists(PW_STORE):
         try:
@@ -121,16 +118,12 @@ def _save_password_for_user(username, password):
         pass
 
 # ----------------------------------------------------------------------
-# Version detection logic
+# Version detection
 # ----------------------------------------------------------------------
 def detect_luna_version(client):
     """
-    Detect Luna firmware version and map it to a known behavior group.
-
-    It runs multiple candidate commands since output format varies by version.
-    Example version strings: "7.7.1", "Firmware Version: 7.3.0"
-
-    Returns: '7.3', '7.7', '7.9', or '' (fallback).
+    Detect Luna firmware version and map it to an internal role definition group.
+    Example: 7.3.x → "7.3", 7.7.x → "7.7", 7.9+ → "7.9"
     """
     candidates = ["version", "show version", "hsm version", "system show version", "hsm show"]
     text = ""
@@ -144,7 +137,7 @@ def detect_luna_version(client):
             break
 
     if not text:
-        print("[WARN] Could not read version output. Using fallback role.")
+        print("[WARN] Could not detect version. Using fallback role.")
         return ""
 
     match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
@@ -153,7 +146,6 @@ def detect_luna_version(client):
 
     major, minor = int(match.group(1)), int(match.group(2))
 
-    # Map firmware version to the corresponding role group
     if major == 7 and minor in (3, 4, 5, 6):
         return "7.3"
     if major == 7 and minor in (7, 8):
@@ -166,15 +158,22 @@ def detect_luna_version(client):
 # Core Luna operations
 # ----------------------------------------------------------------------
 def make_role_file(lines, role_name):
-    """Write a temporary role file to /tmp for SCP transfer."""
-    path = f"/tmp/{role_name}.txt"
+    """
+    Write the role file to an OS-safe temp directory (works on Windows, Linux, macOS).
+    Returns the full path for upload.
+    """
+    tmp_dir = tempfile.gettempdir()
+    path = os.path.join(tmp_dir, f"{role_name}.txt")
+
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         for l in lines:
             f.write(l.rstrip() + "\n")
+
     return path
 
+
 def scp_upload(host, user, local_path, remote_name):
-    """Upload the generated role file to the HSM using the OpenSSH scp client."""
+    """Upload the role file to the HSM via scp."""
     cmd = f'scp -O "{local_path}" {user}@{host}:{remote_name}'
     print(f"[INFO] Uploading role file '{remote_name}' to HSM via scp...")
     result = subprocess.run(cmd, shell=True)
@@ -184,8 +183,9 @@ def scp_upload(host, user, local_path, remote_name):
     print(f"[ERROR] scp failed (rc={result.returncode})")
     return False
 
+
 def create_user(client, username):
-    """Create a new LunaSH user and store its temporary password."""
+    """Create a new LunaSH user with a generated temporary password."""
     temp_pw = _generate_temp_password()
     cmd = f"user add -username {username}"
     out, err, rc = ssh_run(client, cmd, input_text=f"{temp_pw}\n{temp_pw}\n", timeout=60)
@@ -196,8 +196,9 @@ def create_user(client, username):
     print(f"[INFO] User '{username}' created successfully.")
     return temp_pw
 
+
 def import_and_assign(client, username, remote_file, role_name):
-    """Import the uploaded role file and assign it to the newly created user."""
+    """Import the uploaded role file and assign it to the new user."""
     cmds = [
         f"user role import -file {remote_file} -role {role_name}",
         f"user role import -role {role_name} -file {remote_file}",
@@ -221,7 +222,7 @@ def import_and_assign(client, username, remote_file, role_name):
     return False
 
 # ----------------------------------------------------------------------
-# Main execution flow
+# Main execution
 # ----------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -247,7 +248,7 @@ def main():
         print(f"[ERROR] SSH connection failed: {e}")
         return
 
-    # Detect HSM version and select appropriate command set
+    # Detect version and select command set
     tag = detect_luna_version(client)
     role_lines = ROLE_DEFINITIONS.get(tag, FALLBACK_ROLE)
     role_name = f"user_mgmt_role_{tag or 'fallback'}"
@@ -257,26 +258,27 @@ def main():
     print(f"[SUMMARY] Role file: {remote_file}")
     print(f"[SUMMARY] Role name: {role_name}\n")
 
-    # Create temporary local file for SCP transfer
+    # Create and upload role file
     local_path = make_role_file(role_lines, role_name)
     if not scp_upload(host, admin_user, local_path, remote_file):
         client.close()
         return
     os.remove(local_path)
 
-    # Create new user and assign imported role
+    # Create new user
     new_user = input("Enter new username: ").strip()
     pw = create_user(client, new_user)
     if not pw:
         client.close()
         return
 
+    # Import and assign role
     if import_and_assign(client, new_user, remote_file, role_name):
         print(f"\n✅ [SUCCESS] Role '{role_name}' imported and assigned to '{new_user}'.")
     else:
         print("\n❌ [ERROR] Role import or assignment failed.")
 
-    # Validate HSM communication
+    # Verify connectivity
     _, _, rc = ssh_run(client, "hsm show", timeout=20)
     print("[INFO] HSM connectivity verified." if rc == 0 else "[WARN] hsm show returned non-zero.")
 
@@ -284,6 +286,7 @@ def main():
     print(f"\n[SUMMARY] Version detected: {tag or 'fallback'} → Role file '{remote_file}' used for assignment.\n")
 
     client.close()
+
 
 if __name__ == "__main__":
     main()

@@ -2,18 +2,14 @@
 """
 Automated Luna HSM SSH utility.
 
-This script connects to a Luna HSM using SSH credentials based on an HSM ID.
-It performs the following operations:
-
-1. Reads the host/port mapping for the given HSM ID from resources/hsm_mapping.json
-2. Prompts for admin username and password
-3. Connects to the HSM and checks webserver status
-4. Interactively creates a new LunaSH user if chosen
-5. Assigns a role to the newly created user
-6. Uploads a custom role file to the HSM using `scp -O`
-7. Verifies upload with `my file list`
-8. Imports and assigns the uploaded role file
-9. Verifies HSM connectivity with `hsm show`
+- Connects to a Luna HSM via SSH
+- Checks webserver status
+- Creates a LunaSH user
+- Assigns the default role 'user_mgmt_role'
+- Uploads the role file using SCP (cross-platform)
+- Verifies upload with 'my file list'
+- Imports and assigns the uploaded role
+- Confirms HSM connectivity
 """
 
 import sys
@@ -27,7 +23,6 @@ import string
 import datetime
 import platform
 import shutil
-import shlex
 from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
 
 RES_DIR = "resources"
@@ -49,8 +44,8 @@ def load_hsm(hsm_id: str) -> dict:
             return h
     raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in mapping.")
 
-def ssh_run(client: SSHClient, cmd: str, timeout: float = 10, input_text: str = None) -> tuple[str, str, int]:
-    """Runs a single command on the remote LunaSH shell and returns stdout, stderr, and return code."""
+def ssh_run(client: SSHClient, cmd: str, timeout: float = 10, input_text: str = None):
+    """Runs a command on LunaSH and returns stdout, stderr, and exit code."""
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     if input_text:
         try:
@@ -64,7 +59,7 @@ def ssh_run(client: SSHClient, cmd: str, timeout: float = 10, input_text: str = 
     return out, err, rc
 
 def check_webserver_status(client):
-    """Checks if the webserver is enabled, disabled, or unsupported."""
+    """Checks whether the webserver is running or disabled."""
     out, err, rc = ssh_run(client, "webserver show")
     combined = (out + err).lower()
     if "running" in combined or "enabled" in combined:
@@ -82,8 +77,8 @@ def _generate_temp_password(length: int = 16) -> str:
     alphabet = string.ascii_letters + string.digits + "._-"
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def _save_password_for_user(username: str, password: str) -> None:
-    """Saves generated passwords securely in a local JSON file."""
+def _save_password_for_user(username: str, password: str):
+    """Stores user temporary passwords in JSON securely."""
     data = {}
     if os.path.exists(PW_STORE):
         try:
@@ -104,26 +99,13 @@ def _save_password_for_user(username: str, password: str) -> None:
     except Exception:
         pass
 
-def prompt_new_user_and_role() -> tuple[str, str]:
-    """Prompts for the username and role for a new LunaSH user."""
-    while True:
-        new_user = input("Enter new username: ").strip()
-        if new_user:
-            break
-    while True:
-        new_role = input(f"Enter role to assign to '{new_user}': ").strip()
-        if new_role:
-            break
-    return new_user, new_role
-
 def create_lunash_user_and_store_password(client: SSHClient, username: str, role: str) -> bool:
-    """Creates a LunaSH user, assigns a role, and saves the password."""
+    """Creates a LunaSH user, assigns a role, and saves its password."""
     print(f"[INFO] Creating LunaSH user '{username}' with role '{role}' ...")
     temp_pw = _generate_temp_password(16)
     stdin_payload = f"{temp_pw}\n{temp_pw}\n"
     cmd_add = f"user add -username {username}"
     out, err, rc = ssh_run(client, cmd_add, timeout=60, input_text=stdin_payload)
-    combined = (out + err).lower()
     if rc != 0:
         print(f"[ERROR] Failed to create user '{username}'.")
         return False
@@ -138,48 +120,51 @@ def create_lunash_user_and_store_password(client: SSHClient, username: str, role
     return True
 
 def scp_upload_role_file(host: str, destination_user: str, password: str, local_path: str) -> bool:
-    """Uploads the role file to the HSM using scp -O."""
+    """Uploads the role file to the HSM using the appropriate SCP method for the OS."""
     if not os.path.exists(local_path):
         print(f"[ERROR] Role file not found: {local_path}")
         return False
 
     remote = f"{destination_user}@{host}:{REMOTE_ROLE_FILENAME}"
     system = platform.system().lower()
-    sshpass_path = shutil.which("sshpass")
+
+    # Check for scp or pscp
     scp_path = shutil.which("scp")
     pscp_path = shutil.which("pscp") or shutil.which("pscp.exe")
 
-    if sshpass_path and scp_path and not system.startswith("win"):
-        cmd = [sshpass_path, "-p", password, scp_path, "-O", local_path, remote]
-    elif system.startswith("win") and pscp_path:
-        cmd = [pscp_path, "-scp", "-pw", password, local_path, remote]
-    elif scp_path:
-        cmd = [scp_path, "-O", local_path, remote]
-        print("[INFO] You may be prompted to enter the password for SCP.")
-    else:
-        print("[ERROR] No suitable SCP client found.")
-        return False
-
     try:
+        if system.startswith("win") and pscp_path:
+            # Use PuTTY pscp on Windows
+            cmd = [pscp_path, "-scp", "-pw", password, local_path, remote]
+        elif scp_path:
+            # Use OpenSSH scp on Linux/mac/WSL
+            cmd = [scp_path, "-O", local_path, remote]
+        else:
+            print("[ERROR] No SCP utility found (scp/pscp missing).")
+            return False
+
+        print(f"[INFO] Uploading role file {os.path.basename(local_path)} to {host} ...")
         subprocess.run(cmd, check=True)
         print("[INFO] Role file uploaded successfully.")
         return True
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] SCP upload failed. Return code: {e.returncode}")
         return False
+    except Exception as e:
+        print(f"[ERROR] SCP failed: {e}")
+        return False
 
 def verify_file_on_hsm(client: SSHClient, filename: str) -> bool:
-    """Verifies if the uploaded file exists using 'my file list'."""
+    """Verifies that the uploaded file exists on the HSM."""
     out, err, rc = ssh_run(client, "my file list", timeout=15)
-    combined = out + err
-    if rc == 0 and filename in combined:
+    if rc == 0 and filename in (out + err):
         print(f"[INFO] File '{filename}' verified on HSM.")
         return True
     print(f"[WARN] File '{filename}' not found in 'my file list'.")
     return False
 
 def import_and_assign_uploaded_role(client: SSHClient, username: str, role_filename: str, role_name: str) -> bool:
-    """Imports the uploaded role file and assigns it to the user."""
+    """Imports the uploaded role and assigns it to the user."""
     print(f"[INFO] Importing role from '{role_filename}' ...")
     out, err, rc = ssh_run(client, f"user role import -file {role_filename}", timeout=30)
     if rc != 0:
@@ -231,15 +216,14 @@ def main():
 
     answer = input("Create new user now? (y/N): ").strip().lower()
     if answer == "y":
-        new_user, new_role = prompt_new_user_and_role()
+        new_user = input("Enter new username: ").strip()
+        new_role = "user_mgmt_role"
+        print(f"[INFO] Assigning default role '{new_role}' to user '{new_user}'.")
         ok = create_lunash_user_and_store_password(client, new_user, new_role)
         if ok:
-            print(f"[INFO] Uploading custom role file for '{new_user}' ...")
             uploaded = scp_upload_role_file(host, admin_user, admin_pwd, ROLE_LOCAL_PATH)
-            if uploaded:
-                verified = verify_file_on_hsm(client, REMOTE_ROLE_FILENAME)
-                if verified:
-                    import_and_assign_uploaded_role(client, new_user, REMOTE_ROLE_FILENAME, new_role)
+            if uploaded and verify_file_on_hsm(client, REMOTE_ROLE_FILENAME):
+                import_and_assign_uploaded_role(client, new_user, REMOTE_ROLE_FILENAME, new_role)
     else:
         print("[INFO] Skipping user creation.")
 

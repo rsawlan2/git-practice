@@ -1,0 +1,30 @@
+if version.startswith("7.3") or version.startswith("7.4"):
+    role_cmds = [
+        "user add", "user delete", "user enable", "user disable",
+        "user list", "user password",
+        "user role add", "user role delete", "user role clear",
+        "user role list", "user role import"
+    ]
+elif version.startswith("7.7"):
+    role_cmds = [
+        "user add", "user delete", "user enable", "user disable",
+        "user list", "user password", "user radiusAdd",
+        "user role add", "user role delete",
+        "user role list", "user role import"
+    ]
+elif version.startswith("7.8"):
+    role_cmds = [
+        "user add", "user delete", "user enable", "user disable",
+        "user list", "user password", "user radiusAdd",
+        "user role add", "user role delete",
+        "user role list", "user role import"
+    ]
+elif version.startswith("7.9"):
+    role_cmds = [
+        "user add", "user delete", "user enable", "user disable",
+        "user list", "user password", "user radiusAdd", "user radiusDelete",
+        "user role add", "user role delete",
+        "user role list", "user role import"
+    ]
+else:
+    raise ValueError(f"Unsupported HSM firmware version: {version}")

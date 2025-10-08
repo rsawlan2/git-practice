@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+Automated Luna HSM SSH utility.
+
+This script connects to a Luna HSM using SSH credentials based on an HSM ID.
+It performs the following operations:
+
+1. Reads the host/port mapping for the given HSM ID from resources/hsm_mapping.json
+2. Prompts for admin username and password
+3. Connects to the HSM and checks webserver status
+4. Interactively creates a new LunaSH user if chosen
+5. Assigns a role to the newly created user
+6. Uploads a custom role file to the HSM using `scp -O`
+7. Verifies upload with `my file list`
+8. Imports and assigns the uploaded role file
+9. Verifies HSM connectivity with `hsm show`
+"""
+
+import sys
+import subprocess
+import getpass
+import json
+import os
+import socket
+import secrets
+import string
+import datetime
+import platform
+import shutil
+import shlex
+from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
+
+RES_DIR = "resources"
+HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
+ROLE_LOCAL_PATH = os.path.join(RES_DIR, "roles", "user_mgmt_role.txt")
+REMOTE_ROLE_FILENAME = "user_mgmt_role.txt"
+
+os.makedirs(os.path.join(RES_DIR, "roles"), exist_ok=True)
+
+def load_hsm(hsm_id: str) -> dict:
+    """Reads HSM connection details from the mapping file."""
+    if not os.path.exists(HSM_FILE):
+        raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
+    with open(HSM_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for h in data.get("hsms", []):
+        if h.get("id") == hsm_id:
+            return h
+    raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in mapping.")
+
+def ssh_run(client: SSHClient, cmd: str, timeout: float = 10, input_text: str = None) -> tuple[str, str, int]:
+    """Runs a single command on the remote LunaSH shell and returns stdout, stderr, and return code."""
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    if input_text:
+        try:
+            stdin.write(input_text)
+            stdin.flush()
+        except Exception:
+            pass
+    out = stdout.read().decode(errors="ignore")
+    err = stderr.read().decode(errors="ignore")
+    rc = stdout.channel.recv_exit_status() if stdout.channel else -1
+    return out, err, rc
+
+def check_webserver_status(client):
+    """Checks if the webserver is enabled, disabled, or unsupported."""
+    out, err, rc = ssh_run(client, "webserver show")
+    combined = (out + err).lower()
+    if "running" in combined or "enabled" in combined:
+        return "ENABLED"
+    if "not running" in combined or "stopped" in combined or "disabled" in combined:
+        return "DISABLED"
+    if "permission denied" in combined:
+        return "NO_PERMISSION"
+    if "not recognized" in combined or "unknown command" in combined:
+        return "NOT_SUPPORTED"
+    return "UNKNOWN"
+
+def _generate_temp_password(length: int = 16) -> str:
+    """Generates a random temporary password for the new user."""
+    alphabet = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+def _save_password_for_user(username: str, password: str) -> None:
+    """Saves generated passwords securely in a local JSON file."""
+    data = {}
+    if os.path.exists(PW_STORE):
+        try:
+            with open(PW_STORE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data[username] = {
+        "password": password,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z"
+    }
+    tmp = PW_STORE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, PW_STORE)
+    try:
+        os.chmod(PW_STORE, 0o600)
+    except Exception:
+        pass
+
+def prompt_new_user_and_role() -> tuple[str, str]:
+    """Prompts for the username and role for a new LunaSH user."""
+    while True:
+        new_user = input("Enter new username: ").strip()
+        if new_user:
+            break
+    while True:
+        new_role = input(f"Enter role to assign to '{new_user}': ").strip()
+        if new_role:
+            break
+    return new_user, new_role
+
+def create_lunash_user_and_store_password(client: SSHClient, username: str, role: str) -> bool:
+    """Creates a LunaSH user, assigns a role, and saves the password."""
+    print(f"[INFO] Creating LunaSH user '{username}' with role '{role}' ...")
+    temp_pw = _generate_temp_password(16)
+    stdin_payload = f"{temp_pw}\n{temp_pw}\n"
+    cmd_add = f"user add -username {username}"
+    out, err, rc = ssh_run(client, cmd_add, timeout=60, input_text=stdin_payload)
+    combined = (out + err).lower()
+    if rc != 0:
+        print(f"[ERROR] Failed to create user '{username}'.")
+        return False
+    print(f"[INFO] User '{username}' created successfully.")
+    cmd_role = f"user role add -username {username} -role {role}"
+    out2, err2, rc2 = ssh_run(client, cmd_role, timeout=30)
+    if rc2 != 0:
+        print(f"[ERROR] Failed to assign role '{role}' to '{username}'.")
+        return False
+    _save_password_for_user(username, temp_pw)
+    print(f"[INFO] Temporary password saved in {PW_STORE}.")
+    return True
+
+def scp_upload_role_file(host: str, destination_user: str, password: str, local_path: str) -> bool:
+    """Uploads the role file to the HSM using scp -O."""
+    if not os.path.exists(local_path):
+        print(f"[ERROR] Role file not found: {local_path}")
+        return False
+
+    remote = f"{destination_user}@{host}:{REMOTE_ROLE_FILENAME}"
+    system = platform.system().lower()
+    sshpass_path = shutil.which("sshpass")
+    scp_path = shutil.which("scp")
+    pscp_path = shutil.which("pscp") or shutil.which("pscp.exe")
+
+    if sshpass_path and scp_path and not system.startswith("win"):
+        cmd = [sshpass_path, "-p", password, scp_path, "-O", local_path, remote]
+    elif system.startswith("win") and pscp_path:
+        cmd = [pscp_path, "-scp", "-pw", password, local_path, remote]
+    elif scp_path:
+        cmd = [scp_path, "-O", local_path, remote]
+        print("[INFO] You may be prompted to enter the password for SCP.")
+    else:
+        print("[ERROR] No suitable SCP client found.")
+        return False
+
+    try:
+        subprocess.run(cmd, check=True)
+        print("[INFO] Role file uploaded successfully.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] SCP upload failed. Return code: {e.returncode}")
+        return False
+
+def verify_file_on_hsm(client: SSHClient, filename: str) -> bool:
+    """Verifies if the uploaded file exists using 'my file list'."""
+    out, err, rc = ssh_run(client, "my file list", timeout=15)
+    combined = out + err
+    if rc == 0 and filename in combined:
+        print(f"[INFO] File '{filename}' verified on HSM.")
+        return True
+    print(f"[WARN] File '{filename}' not found in 'my file list'.")
+    return False
+
+def import_and_assign_uploaded_role(client: SSHClient, username: str, role_filename: str, role_name: str) -> bool:
+    """Imports the uploaded role file and assigns it to the user."""
+    print(f"[INFO] Importing role from '{role_filename}' ...")
+    out, err, rc = ssh_run(client, f"user role import -file {role_filename}", timeout=30)
+    if rc != 0:
+        print("[ERROR] Failed to import role file.")
+        return False
+    out2, err2, rc2 = ssh_run(client, f"user role add -username {username} -role {role_name}", timeout=20)
+    if rc2 == 0:
+        print(f"[INFO] Role '{role_name}' assigned to user '{username}'.")
+        return True
+    print(f"[ERROR] Failed to assign imported role '{role_name}' to '{username}'.")
+    return False
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--hsm-id", required=True, help="HSM ID from mapping JSON file.")
+    args = p.parse_args()
+
+    hsm = load_hsm(args.hsm_id)
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+
+    admin_user = input("Username: ").strip()
+    admin_pwd = getpass.getpass("Password: ")
+
+    client = SSHClient()
+    client.set_missing_host_key_policy(AutoAddPolicy())
+
+    try:
+        print(f"[INFO] Connecting to {host}:{port} as {admin_user} ...")
+        client.connect(
+            hostname=host,
+            port=port,
+            username=admin_user,
+            password=admin_pwd,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=20,
+        )
+    except AuthenticationException:
+        print("[ERROR] Authentication failed.")
+        return
+    except (SSHException, socket.error) as e:
+        print(f"[ERROR] SSH connection failed: {e}")
+        return
+
+    status = check_webserver_status(client)
+    print(f"[WEB SERVER STATUS] {status}")
+
+    answer = input("Create new user now? (y/N): ").strip().lower()
+    if answer == "y":
+        new_user, new_role = prompt_new_user_and_role()
+        ok = create_lunash_user_and_store_password(client, new_user, new_role)
+        if ok:
+            print(f"[INFO] Uploading custom role file for '{new_user}' ...")
+            uploaded = scp_upload_role_file(host, admin_user, admin_pwd, ROLE_LOCAL_PATH)
+            if uploaded:
+                verified = verify_file_on_hsm(client, REMOTE_ROLE_FILENAME)
+                if verified:
+                    import_and_assign_uploaded_role(client, new_user, REMOTE_ROLE_FILENAME, new_role)
+    else:
+        print("[INFO] Skipping user creation.")
+
+    try:
+        _, _, rc2 = ssh_run(client, "hsm show", timeout=20)
+        if rc2 == 0:
+            print("[INFO] HSM connectivity verified successfully.")
+        else:
+            print("[WARN] HSM check returned non-zero exit code.")
+    except Exception as e:
+        print(f"[ERROR] Could not verify HSM status: {e}")
+
+    client.close()
+
+if __name__ == "__main__":
+    main()

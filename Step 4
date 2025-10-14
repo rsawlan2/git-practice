@@ -210,7 +210,7 @@ def import_and_assign(client, username, remote_file, role_name=FIXED_ROLE_NAME):
         ssh_run(client, f"my file move {remote_file} my file", timeout=10)
 
     import_cmd = f'user role import -file "{remote_file}" -role {role_name}'
-    out, err, rc = ssh_run(client, import_cmd, timeout=40)
+    out, err, rc = ssh_run(client, import_cmd, timeout=180, input_text="proceed\n")
     combo = (out + err).lower()
     if rc != 0 or "error" in combo:
         print(f"[ERROR] Role import failed. Snippet:\n{(out + err)[:800]}")
@@ -218,7 +218,7 @@ def import_and_assign(client, username, remote_file, role_name=FIXED_ROLE_NAME):
     print(f"[INFO] Role '{role_name}' imported successfully.")
 
     assign_cmd = f"user role add -username {username} -role {role_name}"
-    out, err, rc = ssh_run(client, assign_cmd, timeout=20)
+    out, err, rc = ssh_run(client, assign_cmd, timeout=90)
     if rc == 0 and "error" not in (out + err).lower():
         print(f"[INFO] Role '{role_name}' assigned to '{username}'.")
         return True

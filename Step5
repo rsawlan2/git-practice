@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+Luna HSM User Management Automation (Version-Aware, SCP-based)
+----------------------------------------------------------------------
+v3 SSH Spec — Non-interactive + Env-based Username Mapping
+----------------------------------------------------------------------
+
+Features:
+  • Reads HSM details from resources/hsm_mapping.json
+  • SSH creds via CLI (or prompts if missing)
+  • Auto user mapping based on --env (DEV|TE1|TE2|PROD)
+  • Optional overrides for sshuser and newuser
+  • Secure password handling with getpass fallback
+  • Same LunaSH logic (role upload/import/assign)
+----------------------------------------------------------------------
+
+"""
+
+import argparse
+import os
+import json
+import datetime
+import secrets
+import string
+import subprocess
+import getpass
+import socket
+import re
+import tempfile
+from paramiko import SSHClient, AutoAddPolicy, AuthenticationException, SSHException
+
+# ----------------------------------------------------------------------
+# Constants and paths
+# ----------------------------------------------------------------------
+RES_DIR = "resources"
+HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
+os.makedirs(RES_DIR, exist_ok=True)
+
+FIXED_ROLE_NAME = "user_mgmt_role"
+
+# ----------------------------------------------------------------------
+# Role permissions by version group
+# ----------------------------------------------------------------------
+ROLE_DEFINITIONS = {
+    "7.3": [
+        "user list", "user add", "user delete", "user enable", "user disable",
+        "user password", "user role add", "user role delete",
+        "user role clear", "user role list", "user role import"
+    ],
+    "7.7": [
+        "user list", "user add", "user delete", "user enable", "user disable",
+        "user password", "user radiusAdd",
+        "user role add", "user role delete",
+        "user role list", "user role import"
+    ],
+    "7.9": [
+        "user list", "user add", "user delete", "user enable", "user disable",
+        "user password", "user radiusAdd", "user radiusDelete",
+        "user role add", "user role delete",
+        "user role list", "user role import"
+    ]
+}
+FALLBACK_ROLE = [
+    "user list", "user add", "user delete", "user password",
+    "user role list", "user role import"
+]
+
+# ----------------------------------------------------------------------
+# Env → user mapping
+# ----------------------------------------------------------------------
+ENV_USER_MAP = {
+    "DEV": "svc_at48994_usrmgt",
+    "TE1": "svc_at48993_usrmgt",
+    "TE2": "svc_at48992_usrmgt",
+    "PROD": "svc_at49008_usrmgt"
+}
+
+# ----------------------------------------------------------------------
+# SSH utility
+# ----------------------------------------------------------------------
+def ssh_run(client, cmd, timeout=10, input_text=None):
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    if input_text:
+        stdin.write(input_text)
+        stdin.flush()
+    out = stdout.read().decode(errors="ignore")
+    err = stderr.read().decode(errors="ignore")
+    try:
+        rc = stdout.channel.recv_exit_status()
+    except Exception:
+        rc = -1
+    return out, err, rc
+
+# ----------------------------------------------------------------------
+# Load HSM connection mapping
+# ----------------------------------------------------------------------
+def load_hsm(hsm_id):
+    if not os.path.exists(HSM_FILE):
+        raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
+    with open(HSM_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for h in data.get("hsms", []):
+        if h.get("id") == hsm_id:
+            return h
+    raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in mapping.")
+
+# ----------------------------------------------------------------------
+# Password generation and storage
+# ----------------------------------------------------------------------
+def _generate_temp_password(length=16):
+    alphabet = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+def _save_password_for_user(username, password):
+    data = {}
+    if os.path.exists(PW_STORE):
+        try:
+            with open(PW_STORE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data[username] = {"password": password, "created_at": datetime.datetime.utcnow().isoformat() + "Z"}
+    tmp = PW_STORE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, PW_STORE)
+    try:
+        os.chmod(PW_STORE, 0o600)
+    except Exception:
+        pass
+
+# ----------------------------------------------------------------------
+# Detect Luna firmware version
+# ----------------------------------------------------------------------
+def detect_luna_version(client):
+    commands = ["version", "show version", "hsm version", "system show version", "hsm show"]
+    text = ""
+    for cmd in commands:
+        out, err, _ = ssh_run(client, cmd, timeout=8)
+        combo = (out + err).lower()
+        if re.search(r"\d+\.\d+", combo):
+            text = combo
+            break
+    if not text:
+        print("[WARN] Version detection failed. Using fallback role set.")
+        return ""
+    m = re.search(r"(\d+)\.(\d+)", text)
+    if not m:
+        return ""
+    major, minor = int(m.group(1)), int(m.group(2))
+    if major == 7 and minor in (3, 4, 5, 6):
+        return "7.3"
+    if major == 7 and minor in (7, 8):
+        return "7.7"
+    if (major == 7 and minor >= 9) or major >= 8:
+        return "7.9"
+    return ""
+
+# ----------------------------------------------------------------------
+# Create local role file
+# ----------------------------------------------------------------------
+def make_role_file(lines, role_name):
+    tmp_dir = tempfile.gettempdir()
+    path = os.path.join(tmp_dir, f"{role_name}.txt")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        for l in lines:
+            f.write(l.rstrip() + "\n")
+    return path
+
+# ----------------------------------------------------------------------
+# Upload role file via SCP
+# ----------------------------------------------------------------------
+def scp_upload(host, user, local_path, remote_name):
+    cmd = f'scp -O "{local_path}" {user}@{host}:{remote_name}'
+    print(f"[INFO] Uploading role file '{remote_name}' to {host}...")
+    res = subprocess.run(cmd, shell=True)
+    if res.returncode != 0:
+        print(f"[ERROR] scp failed (rc={res.returncode})")
+        return False
+    print("[INFO] Upload successful.")
+    return True
+
+# ----------------------------------------------------------------------
+# Import and assign role
+# ----------------------------------------------------------------------
+def import_and_assign(client, username, remote_file, role_name=FIXED_ROLE_NAME):
+    out, err, _ = ssh_run(client, "my file list", timeout=10)
+    if remote_file.lower() in (out + err).lower():
+        print(f"[INFO] Verified '{remote_file}' present on HSM.")
+    else:
+        print(f"[WARN] '{remote_file}' not found. Attempting to move into 'my file' space.")
+        ssh_run(client, f"my file move {remote_file} my file", timeout=10)
+
+    import_cmd = f'user role import -file "{remote_file}" -role {role_name}'
+    out, err, rc = ssh_run(client, import_cmd, timeout=180, input_text="proceed\n")
+    combo = (out + err).lower()
+    if rc != 0 or "error" in combo:
+        print(f"[ERROR] Role import failed. Snippet:\n{(out + err)[:800]}")
+        return False
+    print(f"[INFO] Role '{role_name}' imported successfully.")
+
+    assign_cmd = f"user role add -username {username} -role {role_name}"
+    out, err, rc = ssh_run(client, assign_cmd, timeout=90)
+    if rc == 0 and "error" not in (out + err).lower():
+        print(f"[INFO] Role '{role_name}' assigned to '{username}'.")
+        return True
+    print(f"[ERROR] Failed to assign role. Output:\n{(out + err)[:600]}")
+    return False
+
+# ----------------------------------------------------------------------
+# Create LunaSH user
+# ----------------------------------------------------------------------
+def create_user(client, username):
+    temp_pw = _generate_temp_password()
+    out, err, rc = ssh_run(client, f"user add -username {username}",
+                           timeout=60, input_text=f"{temp_pw}\n{temp_pw}\n")
+    combo = (out + err).lower()
+    if rc != 0 or "error" in combo:
+        print(f"[ERROR] User creation failed. Output snippet:\n{combo[:800]}")
+        return None
+    _save_password_for_user(username, temp_pw)
+    print(f"[INFO] User '{username}' created successfully.")
+    print(f"[INFO] Temporary password saved in '{PW_STORE}'.")
+    return temp_pw
+
+# ----------------------------------------------------------------------
+# Main logic (v3 SSH Spec)
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Luna HSM User Management (v3 - SSH Non-Interactive)")
+    parser.add_argument("--hsm-id", required=True, help="HSM ID from mapping file.")
+    parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"],
+                        type=str.upper, help="Environment name (case-insensitive).")
+    parser.add_argument("--sshuser", default="admin", help="SSH username (default: admin).")
+    parser.add_argument("--sshpassword", help="SSH password (optional, will prompt if missing).")
+    parser.add_argument("--newuser", help="New LunaSH username (optional; auto-set by env).")
+
+    args = parser.parse_args()
+
+    # Determine username based on env or override
+    env = args.env.upper()
+    if args.newuser:
+        new_user = args.newuser
+        print(f"[INFO] Environment: {env} → using provided user: {new_user}")
+    else:
+        new_user = ENV_USER_MAP.get(env)
+        if not new_user:
+            raise SystemExit(f"[ERROR] Unsupported env '{env}'. Valid: DEV, TE1, TE2, PROD")
+        print(f"[INFO] Environment: {env} → using mapped user: {new_user}")
+
+    # Get password
+    admin_user = args.sshuser
+    admin_pwd = args.sshpassword or getpass.getpass(f"Password for {admin_user}@HSM: ")
+
+    hsm = load_hsm(args.hsm_id)
+    host = hsm.get("ipAddress") or hsm.get("host")
+    port = int(hsm.get("port", 22))
+
+    client = SSHClient()
+    client.set_missing_host_key_policy(AutoAddPolicy())
+
+    try:
+        print(f"[INFO] Connecting to {host}:{port} as {admin_user} ...")
+        client.connect(hostname=host, port=port, username=admin_user,
+                       password=admin_pwd, allow_agent=False,
+                       look_for_keys=False, timeout=20)
+    except (AuthenticationException, SSHException, socket.error) as e:
+        print(f"[ERROR] SSH connection failed: {e}")
+        return
+
+    version_tag = detect_luna_version(client)
+    role_lines = ROLE_DEFINITIONS.get(version_tag, FALLBACK_ROLE)
+    role_filename = f"user_mgmt_role_{version_tag}.txt" if version_tag else "user_mgmt_role_fallback.txt"
+
+    print(f"\n[SUMMARY] Detected version group: {version_tag or 'fallback'}")
+    print(f"[SUMMARY] Using role file: {role_filename}\n")
+
+    local_path = make_role_file(role_lines, os.path.splitext(role_filename)[0])
+    if not scp_upload(host, admin_user, local_path, role_filename):
+        client.close()
+        return
+    os.remove(local_path)
+
+    pw = create_user(client, new_user)
+    if not pw:
+        client.close()
+        return
+
+    if import_and_assign(client, new_user, role_filename, FIXED_ROLE_NAME):
+        print(f"\n✅ [SUCCESS] Role '{FIXED_ROLE_NAME}' imported and assigned to '{new_user}'.")
+    else:
+        print("\n❌ [ERROR] Role import or assignment failed.")
+
+    _, _, rc = ssh_run(client, "hsm show", timeout=20)
+    print("[INFO] HSM connectivity verified." if rc == 0 else "[WARN] hsm show returned non-zero.")
+
+    print(f"\n[SUMMARY] Completed for HSM {args.hsm_id} ({env}). Role file: {role_filename}\n")
+    client.close()
+
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    main()

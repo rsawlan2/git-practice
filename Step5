@@ -15,6 +15,16 @@ Features:
 ----------------------------------------------------------------------
 
 """
+# ----------------------------------------------------------------------
+# Auto-install dependencies (paramiko)
+# ----------------------------------------------------------------------
+try:
+    import paramiko
+except ImportError:
+    import subprocess, sys
+    print("[INFO] Installing missing dependency: paramiko ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko"])
+    import paramiko
 
 import argparse
 import os

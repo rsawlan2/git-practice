@@ -220,6 +220,8 @@ def main():
     base_url = f"https://{host}:8443"
 
     session = requests.Session()
+    # persist basic auth for all requests (fixes 204-login builds)
+    session.auth = (admin_user, admin_pwd)
 
     try:
         rest_login(session, base_url, admin_user, admin_pwd)

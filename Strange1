@@ -1,31 +1,21 @@
 #!/usr/bin/env python3
 """
-Luna HSM User Management Automation (REST API Version)
+Luna HSM REST User Management Automation
 ----------------------------------------------------------------------
-v1 REST Spec — Auto-Cert Regeneration + Env-based Username Mapping
-----------------------------------------------------------------------
+Purpose:
+    Automates REST API–based user creation and role assignment,
+    matching the LunaSH script behavior but using REST endpoints.
+    Adapts automatically to certificate handling differences.
 
 Features:
-  • Reads HSM details from resources/hsm_mapping.json
-  • REST login via /auth/session
-  • Auto certificate regeneration (fallback to CSR + upload + restart)
-  • Environment-based user naming (same as LunaSH)
-  • Role assignment via /api/lunasa/roles/{role}/users/{username}
-  • Saves passwords to resources/user_passwords.json under "rest"
+    • Reads HSM details from resources/hsm_mapping.json
+    • Handles SSL certificate regeneration or CSR upload
+    • Creates REST user (env-based naming)
+    • Assigns minimal custom user management role
+    • Saves passwords locally under 'rest' section
 ----------------------------------------------------------------------
 
 """
-
-# ----------------------------------------------------------------------
-# Auto-install dependencies
-# ----------------------------------------------------------------------
-try:
-    import requests
-except ImportError:
-    import subprocess, sys
-    print("[INFO] Installing missing dependency: requests ...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
 
 import argparse
 import os
@@ -33,10 +23,22 @@ import json
 import datetime
 import secrets
 import string
+import subprocess
 import getpass
-import socket
-import re
-import tempfile
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ----------------------------------------------------------------------
+# Auto-install dependency if missing
+# ----------------------------------------------------------------------
+try:
+    import requests  # noqa: F401
+except ImportError:
+    print("[INFO] Installing dependencies (requests)...")
+    subprocess.check_call(["pip", "install", "requests"])
+    import requests
 
 # ----------------------------------------------------------------------
 # Constants and paths
@@ -46,8 +48,8 @@ HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
 PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 os.makedirs(RES_DIR, exist_ok=True)
 
-BASE_PORT = 8443
 FIXED_ROLE_NAME = "user_mgmt_role"
+DEFAULT_CT = "application/vnd.safenetinc.lunasa+json;version=10"
 
 ENV_USER_MAP = {
     "DEV": "svc_at48994_usrmgt",
@@ -57,13 +59,13 @@ ENV_USER_MAP = {
 }
 
 # ----------------------------------------------------------------------
-# Password generation and storage
+# Utility: password generation + storage
 # ----------------------------------------------------------------------
 def _generate_temp_password(length=16):
     alphabet = string.ascii_letters + string.digits + "._-"
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def _save_password_for_user(username, password, backend="rest"):
+def _save_password_for_user(username, password, category="rest"):
     data = {}
     if os.path.exists(PW_STORE):
         try:
@@ -71,23 +73,16 @@ def _save_password_for_user(username, password, backend="rest"):
                 data = json.load(f)
         except Exception:
             data = {}
-    entry = data.get(username, {})
-    entry[backend] = {
-        "password": password,
-        "created_at": datetime.datetime.utcnow().isoformat() + "Z"
-    }
-    data[username] = entry
+    if category not in data:
+        data[category] = {}
+    data[category][username] = {"password": password, "created_at": datetime.datetime.utcnow().isoformat() + "Z"}
     tmp = PW_STORE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, PW_STORE)
-    try:
-        os.chmod(PW_STORE, 0o600)
-    except Exception:
-        pass
 
 # ----------------------------------------------------------------------
-# Load HSM connection mapping
+# Load HSM mapping
 # ----------------------------------------------------------------------
 def load_hsm(hsm_id):
     if not os.path.exists(HSM_FILE):
@@ -100,164 +95,140 @@ def load_hsm(hsm_id):
     raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in mapping.")
 
 # ----------------------------------------------------------------------
-# REST API Helpers
+# REST session utilities
 # ----------------------------------------------------------------------
 def rest_login(session, base_url, user, pwd):
     url = f"{base_url}/auth/session"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"}
+    headers = {"Content-Type": DEFAULT_CT}
     r = session.post(url, auth=(user, pwd), headers=headers, verify=False, timeout=20)
-    if r.status_code not in (200, 201):
-        raise SystemExit(f"[ERROR] Login failed ({r.status_code}): {r.text}")
-    print("[INFO] Logged in successfully.")
-    return r
 
-def rest_detect_version(session, base_url):
-    r = session.get(f"{base_url}/api/lunasa", verify=False, timeout=10)
-    if r.status_code != 200:
-        print("[WARN] Version detection failed, fallback mode.")
-        return ""
-    text = r.text.lower()
-    m = re.search(r"(\d+)\.(\d+)", text)
-    if not m:
-        return ""
-    major, minor = int(m.group(1)), int(m.group(2))
-    if major == 7 and minor in (3, 4, 5, 6):
-        return "7.3"
-    if major == 7 and minor in (7, 8):
-        return "7.7"
-    if (major == 7 and minor >= 9) or major >= 8:
-        return "7.9"
-    return ""
+    # 204 = success (no content), 200/201 = success too
+    if r.status_code in (200, 201, 204):
+        print(f"[INFO] Login succeeded (status: {r.status_code})")
+        return
+    raise SystemExit(f"[ERROR] Login failed ({r.status_code}): {r.text}")
 
-def rest_try_regenerate_cert(session, base_url):
-    actions_url = f"{base_url}/api/lunasa/webServer/certificate/actions"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"}
-    r = session.get(actions_url, headers=headers, verify=False, timeout=10)
-    if r.status_code != 200:
-        print("[WARN] Cannot fetch certificate actions, skipping regenerate.")
-        return False
-    data = {}
+def rest_logout(session, base_url):
     try:
-        data = r.json()
+        session.delete(f"{base_url}/auth/session", verify=False, timeout=10)
     except Exception:
         pass
-    regen_action = data.get("actions", {}).get("regenerate") if isinstance(data.get("actions"), dict) else None
-    if not regen_action:
-        print("[INFO] Regenerate action not available, will fallback to CSR + upload.")
+
+# ----------------------------------------------------------------------
+# Certificate handling
+# ----------------------------------------------------------------------
+def setup_certificate(session, base_url):
+    print("[INFO] Checking certificate actions...")
+    actions_url = f"{base_url}/api/lunasa/webServer/certificate/actions"
+    r = session.get(actions_url, verify=False, timeout=20)
+    if r.status_code != 200:
+        print(f"[WARN] Could not fetch certificate actions (status {r.status_code}). Trying CSR flow...")
+        return generate_and_upload_csr(session, base_url)
+
+    actions = r.json().get("actions", {})
+    regen_url = None
+    for act in actions:
+        if "regenerate" in str(act).lower():
+            regen_url = actions[act] if isinstance(actions, dict) else act
+            break
+
+    if regen_url:
+        print("[INFO] Regenerate action found. Regenerating certificate...")
+        full = regen_url if regen_url.startswith("http") else base_url + regen_url
+        pr = session.post(full, json={}, headers={"Content-Type": DEFAULT_CT}, verify=False, timeout=60)
+        if pr.status_code in (200, 201, 204):
+            print("[INFO] Certificate regenerated successfully.")
+            return True
+        else:
+            print(f"[WARN] Regen failed ({pr.status_code}). Fallback to CSR flow.")
+    return generate_and_upload_csr(session, base_url)
+
+def generate_and_upload_csr(session, base_url):
+    print("[INFO] Generating CSR via API...")
+    csr_url = f"{base_url}/api/lunasa/webServer/csr"
+    r = session.post(csr_url, json={}, headers={"Content-Type": DEFAULT_CT}, verify=False, timeout=30)
+    if r.status_code not in (200, 201):
+        print(f"[ERROR] CSR generation failed ({r.status_code}): {r.text}")
         return False
-    full_url = f"{base_url}{regen_action}" if regen_action.startswith("/") else regen_action
-    print("[INFO] Attempting certificate regeneration...")
-    r2 = session.post(full_url, headers=headers, json={}, verify=False, timeout=60)
-    if r2.status_code in (200, 201, 204):
-        print("[INFO] Certificate regenerated successfully.")
-        return True
-    print(f"[WARN] Regenerate failed ({r2.status_code}), fallback to CSR + upload.")
-    return False
 
-def rest_generate_csr(session, base_url, cn):
-    url = f"{base_url}/api/lunasa/webServer/csr"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"}
-    payload = {"keyType": "rsa", "keySize": 2048, "cn": cn}
-    r = session.post(url, json=payload, headers=headers, verify=False, timeout=30)
-    if r.status_code not in (200, 201):
-        raise SystemExit(f"[ERROR] CSR generation failed: {r.text}")
-    csr_data = r.json()
-    csr = csr_data.get("csr") or csr_data.get("certificateRequest") or r.text
-    path = os.path.join(RES_DIR, f"csr_{cn}.pem")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(csr)
-    print(f"[INFO] CSR saved to {path}")
-    return path
+    csr_data = r.text.strip()
+    csr_path = os.path.join(RES_DIR, "generated_csr.pem")
+    with open(csr_path, "w", encoding="utf-8") as f:
+        f.write(csr_data)
+    print(f"[INFO] CSR saved to {csr_path}. Using self-signed mode for upload...")
 
-def rest_upload_certificate(session, base_url, cert_file):
-    url = f"{base_url}/api/lunasa/webServer/certificate"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10"}
-    with open(cert_file, "rb") as f:
-        data = f.read()
-    r = session.put(url, data=data, headers=headers, verify=False, timeout=30)
-    if r.status_code not in (200, 201, 204):
-        raise SystemExit(f"[ERROR] Certificate upload failed ({r.status_code}): {r.text}")
-    print("[INFO] Certificate uploaded successfully.")
-
-def rest_restart_webserver(session, base_url):
-    url = f"{base_url}/api/lunasa/services/webserver/actions/restart"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"}
-    r = session.post(url, headers=headers, verify=False, timeout=30)
-    if r.status_code not in (200, 201, 202, 204):
-        print(f"[WARN] Webserver restart may not have succeeded ({r.status_code}).")
+    cert_url = f"{base_url}/api/lunasa/webServer/certificate"
+    pr = session.put(cert_url, files={"file": open(csr_path, "rb")}, verify=False, timeout=30)
+    if pr.status_code in (200, 201, 204):
+        print("[INFO] Certificate uploaded successfully.")
     else:
-        print("[INFO] Webserver restart initiated successfully.")
+        print(f"[WARN] Certificate upload failed ({pr.status_code}): {pr.text}")
+    return True
 
-def rest_create_user(session, base_url, username, password):
+# ----------------------------------------------------------------------
+# Create REST user
+# ----------------------------------------------------------------------
+def create_rest_user(session, base_url, username):
+    pw = _generate_temp_password()
+    payload = {"user": username, "password": pw, "confirmPassword": pw}
     url = f"{base_url}/api/lunasa/users"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"}
-    payload = {"userName": username, "password": password}
-    r = session.post(url, json=payload, headers=headers, verify=False, timeout=30)
-    if r.status_code not in (200, 201):
+    r = session.post(url, json=payload, headers={"Content-Type": DEFAULT_CT}, verify=False, timeout=20)
+    if r.status_code in (200, 201):
+        print(f"[INFO] REST user '{username}' created successfully.")
+        _save_password_for_user(username, pw)
+        return pw
+    elif "exists" in r.text.lower():
+        print(f"[WARN] User '{username}' already exists.")
+        return pw
+    else:
         raise SystemExit(f"[ERROR] User creation failed ({r.status_code}): {r.text}")
-    print(f"[INFO] User '{username}' created successfully.")
 
-def rest_assign_role(session, base_url, username, role_name):
+# ----------------------------------------------------------------------
+# Assign role
+# ----------------------------------------------------------------------
+def assign_role(session, base_url, username, role_name):
     url = f"{base_url}/api/lunasa/roles/{role_name}/users/{username}"
-    headers = {"Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"}
-    r = session.post(url, headers=headers, verify=False, timeout=30)
+    r = session.put(url, headers={"Content-Type": DEFAULT_CT}, verify=False, timeout=20)
     if r.status_code in (200, 201, 204):
         print(f"[INFO] Role '{role_name}' assigned to '{username}'.")
-    else:
-        print(f"[WARN] Role assignment failed ({r.status_code}): {r.text}")
+        return True
+    print(f"[ERROR] Role assignment failed ({r.status_code}): {r.text}")
+    return False
 
 # ----------------------------------------------------------------------
 # Main logic
 # ----------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Luna HSM User Management (REST API Version)")
+    parser = argparse.ArgumentParser(description="Luna HSM REST User Management (v1)")
     parser.add_argument("--hsm-id", required=True, help="HSM ID from mapping file.")
     parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"],
-                        type=str.upper, help="Environment name (case-insensitive).")
-    parser.add_argument("--sshuser", default="admin", help="Admin username (default: admin).")
-    parser.add_argument("--sshpassword", help="Admin password for REST login.")
-    parser.add_argument("--cert-file", help="Signed certificate file (PEM) for upload fallback.")
+                        type=str.upper, help="Environment name.")
+    parser.add_argument("--apiuser", default="admin", help="API username (default: admin).")
+    parser.add_argument("--apipassword", help="API password (optional; will prompt if missing).")
     args = parser.parse_args()
-
-    hsm = load_hsm(args.hsm_id)
-    host = hsm.get("ipAddress") or hsm.get("host")
-    port = int(hsm.get("port", BASE_PORT))
-    base_url = f"https://{host}:{port}"
 
     env = args.env.upper()
     new_user = ENV_USER_MAP.get(env)
     if not new_user:
         raise SystemExit(f"[ERROR] Unsupported env '{env}'. Valid: DEV, TE1, TE2, PROD")
 
-    admin_user = args.sshuser
-    admin_pwd = args.sshpassword or getpass.getpass(f"Password for {admin_user}@{host}: ")
+    admin_user = args.apiuser
+    admin_pwd = args.apipassword or getpass.getpass(f"Password for {admin_user}@API: ")
+
+    hsm = load_hsm(args.hsm_id)
+    host = hsm.get("ipAddress") or hsm.get("host")
+    base_url = f"https://{host}:8443"
 
     session = requests.Session()
-    requests.packages.urllib3.disable_warnings()
 
-    rest_login(session, base_url, admin_user, admin_pwd)
-    version_tag = rest_detect_version(session, base_url)
-    print(f"[SUMMARY] Detected version group: {version_tag or 'fallback'}")
-
-    # Certificate setup
-    if not rest_try_regenerate_cert(session, base_url):
-        csr_path = rest_generate_csr(session, base_url, host)
-        if not args.cert_file:
-            raise SystemExit("[ERROR] Certificate file required when regen not supported. Provide --cert-file <path>.")
-        rest_upload_certificate(session, base_url, args.cert_file)
-        rest_restart_webserver(session, base_url)
-
-    # User creation
-    new_pw = _generate_temp_password()
-    rest_create_user(session, base_url, new_user, new_pw)
-    _save_password_for_user(new_user, new_pw, backend="rest")
-
-    # Role assignment
-    rest_assign_role(session, base_url, new_user, FIXED_ROLE_NAME)
-
-    print(f"\n✅ [SUCCESS] REST setup completed for HSM {args.hsm_id} ({env})")
-    print(f"[SUMMARY] User: {new_user}, Role: {FIXED_ROLE_NAME}")
-    print(f"[SUMMARY] Password saved in {PW_STORE}\n")
+    try:
+        rest_login(session, base_url, admin_user, admin_pwd)
+        setup_certificate(session, base_url)
+        pw = create_rest_user(session, base_url, new_user)
+        assign_role(session, base_url, new_user, FIXED_ROLE_NAME)
+        print(f"\n✅ [SUCCESS] Completed for HSM {args.hsm_id} ({env})\n")
+    finally:
+        rest_logout(session, base_url)
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":

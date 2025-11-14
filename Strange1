@@ -26,7 +26,7 @@ def load_json(path):
 
 def gen_pw(n=16):
     a = string.ascii_letters + string.digits + "._-"
-    return ''.join(secrets.choice(a) for _ in range(n))
+    return ''.join(secrets.choice(a) for _ in a)
 
 def save_pw(user, pw):
     data = {}
@@ -91,12 +91,15 @@ def get_hsm_id(sess, base):
     return hid
 
 def attach_action(sess, base, hid, rid, act):
-    return sess.post(f"{base}/api/lunasa/hsms/{hid}/roles/{rid}/actions/{act}", timeout=20)
+    return sess.post(f"{base}/api/lunasa/hsms/{hid}/roles/{rid}/actions/{act}",
+                     timeout=20)
 
 def create_user(sess, base, uid, pw, role):
-    return sess.post(f"{base}/api/lunasa/users",
-                     json={"userId": uid, "password": pw, "role": role},
-                     timeout=20)
+    return sess.post(
+        f"{base}/api/lunasa/users",
+        json={"userId": uid, "password": pw, "role": role},
+        timeout=20
+    )
 
 def main():
     p = argparse.ArgumentParser()
@@ -109,6 +112,7 @@ def main():
     p.add_argument("--role-name", default="User Management Role")
     a = p.parse_args()
 
+    # load data files
     hmap = load_json(HSM_FILE)
     vmap = load_json(VERSION_MAP_FILE)
     amap = load_json(ROLE_MAP_FILE)
@@ -121,6 +125,7 @@ def main():
     port = int(entry.get("port", 8443))
     base = f"https://{host}:{port}"
 
+    # use fwVersion from mapping.json BEFORE login
     fw_file_version = entry.get("fwVersion")
     if not fw_file_version:
         raise SystemExit("[ERROR] fwVersion missing in mapping.json")
@@ -132,10 +137,11 @@ def main():
         fw_norm = fw_file_version
 
     if fw_norm not in vmap:
-        raise SystemExit(f"[ERROR] version_map.json missing key {fw_norm}")
+        raise SystemExit(f"[ERROR] version_map.json missing entry for {fw_norm}")
 
     api_version = vmap[fw_norm]
 
+    # env user mapping
     ENV_MAP = {
         "DEV": "svc_at48994_usrmgt",
         "TE1": "svc_at48993_usrmgt",
@@ -151,6 +157,7 @@ def main():
     sess = requests.Session()
     sess.verify = False
 
+    # FIXED LOGIN CT
     sess.headers.clear()
     sess.headers.update({
         "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}"
@@ -163,6 +170,7 @@ def main():
 
     fw = detect_fw(sess, base)
 
+    # after login, keep same CT for all calls
     ct = f"application/vnd.safenetinc.lunasa+json;version={api_version}"
     sess.headers.update({"Content-Type": ct})
     print(f"[INFO] CT: {ct}")
@@ -173,10 +181,13 @@ def main():
     actions = amap[fw_norm]
     print(f"[INFO] Actions: {actions}")
 
+    # create role
     create_role(sess, base, a.role_id, a.role_name)
 
+    # get HSM ID
     hid = get_hsm_id(sess, base)
 
+    # attach actions
     for act in actions:
         r = attach_action(sess, base, hid, a.role_id, act)
         if r.status_code in (200, 201, 204):
@@ -184,6 +195,7 @@ def main():
         else:
             print(f"[WARN] action {act} failed ({r.status_code})")
 
+    # create user
     r = create_user(sess, base, new_user, new_user_pw, a.role_id)
     if r.status_code in (200, 201, 204):
         print(f"[OK] User {new_user} created")

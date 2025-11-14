@@ -26,7 +26,7 @@ def load_json(path):
 
 def gen_pw(n=16):
     a = string.ascii_letters + string.digits + "._-"
-    return ''.join(secrets.choice(a) for _ in range(n))
+    return ''.join(secrets.choice(a) for _ in array)
 
 def save_pw(user, pw):
     data = {}
@@ -59,9 +59,8 @@ def rest_login(sess, base, user, pw):
         raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
 
     cookies = sess.cookies.get_dict()
-    if cookies:
-        for k, v in cookies.items():
-            sess.headers.update({"Cookie": f"{k}={v}"})
+    for k, v in cookies.items():
+        sess.headers.update({"Cookie": f"{k}={v}"})
 
     print("[INFO] Login ok.")
 
@@ -133,17 +132,21 @@ def main():
     }
     new_user = a.newuser or ENV_MAP[a.env]
 
-    api_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
+    api_user = a.apiuser or "admin"
+    api_pw = a.apipw or getpass.getpass(f"Password for {api_user}@HSM: ")
     new_user_pw = gen_pw()
 
     sess = requests.Session()
     sess.verify = False
 
-    # no CT for login (previous version behavior)
+    # ⭐ LOGIN uses ONLY Accept header (required by appliance)
     sess.headers.clear()
+    sess.headers.update({
+        "Accept": "application/vnd.safenetinc.lunasa+json"
+    })
 
     print(f"[INFO] Connecting to {host}:{port} ...")
-    rest_login(sess, base, a.apiuser, api_pw)
+    rest_login(sess, base, api_user, api_pw)
 
     fw = detect_fw(sess, base)
 
@@ -166,6 +169,7 @@ def main():
     create_role(sess, base, a.role_id, a.role_name)
 
     hid = get_hsm_id(sess, base)
+
     for act in actions:
         r = attach_action(sess, base, hid, a.role_id, act)
         if r.status_code in (200,201,204):

@@ -58,9 +58,11 @@ def rest_login(sess, base, user, pw):
     if r.status_code not in (200,204):
         raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
 
+    # accept ANY cookie name returned
     cookies = sess.cookies.get_dict()
-    for k, v in cookies.items():
-        sess.headers.update({"Cookie": f"{k}={v}"})
+    if cookies:
+        for k, v in cookies.items():
+            sess.headers.update({"Cookie": f"{k}={v}"})
 
     print("[INFO] Login ok.")
 
@@ -133,28 +135,22 @@ def main():
     new_user = a.newuser or ENV_MAP[a.env]
 
     admin_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
-
     new_user_pw = gen_pw()
 
     sess = requests.Session()
     sess.verify = False
 
-    # ⭐ LOGIN MUST USE VERSION 10 CONTENT-TYPE
+    # ⭐ ensure absolutely no headers before login
     sess.headers.clear()
-    sess.headers.update({
-        "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"
-    })
 
     print(f"[INFO] Connecting to {host}:{port} ...")
     rest_login(sess, base, a.apiuser, admin_pw)
 
-    # now detect real firmware
     fw = detect_fw(sess, base)
+    ct = pick_ct(fw, vmap)
+    sess.headers.update({"Content-Type": ct})
 
-    # update CT to real firmware version
-    real_ct = pick_ct(fw, vmap)
-    sess.headers.update({"Content-Type": real_ct})
-    print(f"[INFO] CT: {real_ct}")
+    print(f"[INFO] CT: {ct}")
 
     if fw not in amap:
         raise SystemExit("[ERROR] Firmware action map missing.")

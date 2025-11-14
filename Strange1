@@ -1,246 +1,178 @@
 #!/usr/bin/env python3
 """
-Luna HSM User Management Automation (REST, Version-Aware)
-----------------------------------------------------------------------
-v1 REST Spec — Non-interactive + Env-based Username Mapping
-----------------------------------------------------------------------
-
-Features:
-  • Reads resources/hsm_mapping.json
-  • Reads resources/version_map.json
-  • Reads resources/rest_role_actions.json
-  • REST-only: login, create role, attach actions, create user
-  • Auto-installs dependency 'requests' if missing
-  • Saves generated passwords to resources/user_passwords.json (600)
-----------------------------------------------------------------------
-
-Usage:
-  python3 rest_user_mgmt.py --hsm-id <id> --env DEV --admin admin \
-         --admin-pw <pw> --newuser <user> --newuser-pw <pw>
-----------------------------------------------------------------------
+Luna HSM User Management (REST, version-aware)
 """
-
-# ----------------------------------------------------------------------
-# Auto-install dependencies (requests)
-# ----------------------------------------------------------------------
 try:
     import requests
 except ImportError:
     import subprocess, sys
-    print("[INFO] Installing missing dependency: requests ...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-import argparse
-import json
-import os
-import datetime
-import secrets
-import string
-import re
-import sys
+import argparse, json, os, getpass, secrets, string, re, datetime, sys
 
-# ----------------------------------------------------------------------
-# Constants and resource paths
-# ----------------------------------------------------------------------
 RES_DIR = "resources"
-HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
-VERSION_MAP_FILE = os.path.join(RES_DIR, "version_map.json")
-ROLE_MAP_FILE = os.path.join(RES_DIR, "rest_role_actions.json")
-PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
+HSM_FILE = f"{RES_DIR}/hsm_mapping.json"
+VERSION_MAP_FILE = f"{RES_DIR}/version_map.json"
+ROLE_MAP_FILE = f"{RES_DIR}/rest_role_actions.json"
+PW_STORE = f"{RES_DIR}/user_passwords.json"
 os.makedirs(RES_DIR, exist_ok=True)
 
-# ----------------------------------------------------------------------
-# Helpers: password generation & storage
-# ----------------------------------------------------------------------
-def _generate_temp_password(length=16):
-    alphabet = string.ascii_letters + string.digits + "._-"
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
+def load_json(path):
+    if not os.path.exists(path):
+        raise SystemExit(f"[ERROR] Missing: {path}")
+    with open(path, "r") as f:
+        return json.load(f)
 
-def _save_password_for_user(username, password):
+def gen_pw(n=16):
+    a = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(a) for _ in range(n))
+
+def save_pw(user, pw):
     data = {}
     if os.path.exists(PW_STORE):
         try:
-            with open(PW_STORE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
+            data = json.load(open(PW_STORE))
+        except:
             data = {}
-    data[username] = {"password": password, "created_at": datetime.datetime.utcnow().isoformat() + "Z"}
+    data[user] = {"password": pw, "created_at": datetime.datetime.utcnow().isoformat()+"Z"}
     tmp = PW_STORE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, PW_STORE)
-    try:
-        os.chmod(PW_STORE, 0o600)
-    except Exception:
-        pass
+    try: os.chmod(PW_STORE, 0o600)
+    except: pass
 
-# ----------------------------------------------------------------------
-# JSON loader
-# ----------------------------------------------------------------------
-def load_json(path):
-    if not os.path.exists(path):
-        raise SystemExit(f"[ERROR] Missing mapping file: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-# ----------------------------------------------------------------------
-# Content-Type selector using version_map.json
-# ----------------------------------------------------------------------
-def pick_content_type_for_fw(version_text, version_map):
-    v = version_text.strip()
-    if not v:
-        raise SystemExit("[ERROR] Empty firmware version string.")
-    # exact match
-    if v in version_map:
-        token = version_map[v]
-        return f"application/vnd.safenetinc.lunasa+json;version={token}"
-    # try major.minor.0 fallback
+def pick_ct(version, vmap):
+    v = version.strip()
+    if v in vmap:
+        return f"application/vnd.safenetinc.lunasa+json;version={vmap[v]}"
     m = re.match(r"(\d+\.\d+)", v)
     if m:
         mm = m.group(1)
-        cand = mm + ".0"
-        if cand in version_map:
-            print(f"[WARN] Using fallback version key {cand} for detected {v}")
-            return f"application/vnd.safenetinc.lunasa+json;version={version_map[cand]}"
-        if mm in version_map:
-            print(f"[WARN] Using fallback version key {mm} for detected {v}")
-            return f"application/vnd.safenetinc.lunasa+json;version={version_map[mm]}"
-    raise SystemExit(f"[ERROR] No content-type mapping for firmware: {v}")
+        if mm+".0" in vmap:
+            return f"application/vnd.safenetinc.lunasa+json;version={vmap[mm+'.0']}"
+        if mm in vmap:
+            return f"application/vnd.safenetinc.lunasa+json;version={vmap[mm]}"
+    raise SystemExit(f"[ERROR] No CT mapping for {v}")
 
-# ----------------------------------------------------------------------
-# REST wrappers
-# ----------------------------------------------------------------------
-def rest_login(sess, base, admin, admin_pw):
-    r = sess.post(f"{base}/auth/session", auth=(admin, admin_pw), timeout=20)
-    if r.status_code not in (200, 204):
+def rest_login(sess, base, user, pw):
+    r = sess.post(f"{base}/auth/session", auth=(user, pw), timeout=20)
+    if r.status_code not in (200,204):
         raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
-    print("[INFO] Login successful (SESSION_ID cookie stored).")
+    sid = None
+    c = sess.cookies.get_dict()
+    if "SESSION_ID" in c: sid = c["SESSION_ID"]
+    try:
+        j = r.json()
+        if not sid:
+            sid = j.get("sessionId") or j.get("SESSION_ID") or j.get("id")
+    except: pass
+    if sid:
+        sess.headers.update({"Cookie": f"SESSION_ID={sid}"})
+    print("[INFO] Login ok.")
 
-def detect_firmware(sess, base):
+def detect_fw(sess, base):
     r = sess.get(f"{base}/api/lunasa", timeout=20)
     r.raise_for_status()
-    ver = r.json().get("version", "").strip()
-    if not ver:
-        raise SystemExit("[ERROR] Firmware version not found in /api/lunasa")
-    print(f"[INFO] Detected firmware version: {ver}")
-    return ver
+    v = r.json().get("version","").strip()
+    if not v: raise SystemExit("[ERROR] No version.")
+    print(f"[INFO] Firmware: {v}")
+    return v
 
-def create_role(sess, base, role_id, role_name):
-    payload = {"roleId": role_id, "fullName": role_name}
-    r = sess.post(f"{base}/api/lunasa/roles", json=payload, timeout=20)
-    if r.status_code not in (200,201,204):
-        r.raise_for_status()
-    print(f"[INFO] Role '{role_id}' created or already exists.")
+def create_role(sess, base, rid, name):
+    r = sess.post(f"{base}/api/lunasa/roles",
+                  json={"roleId": rid, "fullName": name}, timeout=20)
+    if r.status_code not in (200,201,204): r.raise_for_status()
+    print(f"[INFO] Role {rid} ok.")
 
 def get_hsm_id(sess, base):
     r = sess.get(f"{base}/api/lunasa/hsms", timeout=20)
     r.raise_for_status()
-    arr = r.json().get("hsms", [])
-    if not arr:
-        raise SystemExit("[ERROR] /api/lunasa/hsms returned no devices")
+    arr = r.json().get("hsms",[])
+    if not arr: raise SystemExit("[ERROR] No HSMs.")
     h = arr[0]
-    hsm_id = h.get("serialNumber") or h.get("id") or h.get("serial")
-    if not hsm_id:
-        raise SystemExit("[ERROR] Could not extract HSM serial from /hsms response")
-    print(f"[INFO] Using HSM ID: {hsm_id}")
-    return hsm_id
+    hid = h.get("serialNumber") or h.get("id") or h.get("serial")
+    if not hid: raise SystemExit("[ERROR] No HSM id.")
+    print(f"[INFO] HSM ID: {hid}")
+    return hid
 
-def attach_action(sess, base, hsm_id, role_id, action_id):
-    return sess.post(f"{base}/api/lunasa/hsms/{hsm_id}/roles/{role_id}/actions/{action_id}", timeout=20)
+def attach_action(sess, base, hid, rid, act):
+    return sess.post(f"{base}/api/lunasa/hsms/{hid}/roles/{rid}/actions/{act}", timeout=20)
 
-def create_user(sess, base, user_id, password, role):
-    payload = {"userId": user_id, "password": password, "role": role}
-    return sess.post(f"{base}/api/lunasa/users", json=payload, timeout=20)
+def create_user(sess, base, uid, pw, role):
+    return sess.post(f"{base}/api/lunasa/users",
+                     json={"userId": uid, "password": pw, "role": role},
+                     timeout=20)
 
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Luna HSM REST user management")
-    parser.add_argument("--hsm-id", required=True)
-    parser.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"], type=str.upper)
-    parser.add_argument("--admin", default="admin")
-    parser.add_argument("--admin-pw", required=True)
-    parser.add_argument("--newuser")
-    parser.add_argument("--newuser-pw")
-    parser.add_argument("--role-id", default="user_mgmt_role")
-    parser.add_argument("--role-name", default="User Management Role")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--hsm-id", required=True)
+    p.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"], type=str.upper)
+    p.add_argument("--apiuser", default="admin")
+    p.add_argument("--apipw")
+    p.add_argument("--newuser")
+    p.add_argument("--role-id", default="user_mgmt_role")
+    p.add_argument("--role-name", default="User Management Role")
+    a = p.parse_args()
 
-    hsm_map = load_json(HSM_FILE)
-    version_map = load_json(VERSION_MAP_FILE)
-    role_map = load_json(ROLE_MAP_FILE)
+    hmap = load_json(HSM_FILE)
+    vmap = load_json(VERSION_MAP_FILE)
+    amap = load_json(ROLE_MAP_FILE)
 
-    hsm_entry = next((h for h in hsm_map.get("hsms", []) if h.get("id") == args.hsm_id), None)
-    if not hsm_entry:
-        raise SystemExit(f"[ERROR] HSM id '{args.hsm_id}' not found.")
+    entry = next((h for h in hmap["hsms"] if h["id"] == a.hsm_id), None)
+    if not entry: raise SystemExit("[ERROR] HSM not found.")
 
-    host = hsm_entry.get("ipAddress") or hsm_entry.get("host")
-    port = int(hsm_entry.get("port", 8443))
+    host = entry.get("ipAddress") or entry.get("host")
+    port = int(entry.get("port", 8443))
     base = f"https://{host}:{port}"
 
-    ENV_USER_MAP = {
+    ENV_MAP = {
         "DEV": "svc_at48994_usrmgt",
         "TE1": "svc_at48993_usrmgt",
         "TE2": "svc_at48992_usrmgt",
         "PROD": "svc_at49008_usrmgt"
     }
+    new_user = a.newuser or ENV_MAP[a.env]
 
-    new_user = args.newuser or ENV_USER_MAP[args.env]
-    new_user_pw = args.newuser_pw or _generate_temp_password()
+    admin_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
+    new_user_pw = gen_pw()
 
     sess = requests.Session()
     sess.verify = False
-    sess.headers.update({"Content-Type": "application/json"})
 
-    print(f"[INFO] Connecting to {host}:{port} as {args.admin} ...")
-    rest_login(sess, base, args.admin, args.admin_pw)
+    print(f"[INFO] Connecting to {host}:{port} ...")
+    rest_login(sess, base, a.apiuser, admin_pw)
 
-    fw = detect_firmware(sess, base)
+    fw = detect_fw(sess, base)
+    ct = pick_ct(fw, vmap)
+    sess.headers.update({"Content-Type": ct})
+    print(f"[INFO] CT: {ct}")
 
-    ct_header = pick_content_type_for_fw(fw, version_map)
-    sess.headers.update({"Content-Type": ct_header})
-    print(f"[INFO] Using Content-Type header: {ct_header}")
+    if fw not in amap:
+        raise SystemExit("[ERROR] Missing action map for this firmware.")
 
-    if fw not in role_map:
-        raise SystemExit(f"[ERROR] Firmware '{fw}' not present in {ROLE_MAP_FILE}")
+    actions = amap[fw]
+    print(f"[INFO] Actions: {actions}")
 
-    actions = role_map[fw]
-    print(f"[INFO] Actions to attach for {fw}: {actions}")
+    create_role(sess, base, a.role_id, a.role_name)
 
-    create_role(sess, base, args.role_id, args.role_name)
-
-    hsm_id = get_hsm_id(sess, base)
-
-    attached = []
-    failures = []
-    for action in actions:
-        r = attach_action(sess, base, hsm_id, args.role_id, action)
+    hid = get_hsm_id(sess, base)
+    for act in actions:
+        r = attach_action(sess, base, hid, a.role_id, act)
         if r.status_code in (200,201,204):
-            attached.append(action)
-            print(f"[OK] Attached action {action}")
+            print(f"[OK] action {act}")
         else:
-            failures.append({"action": action, "status": r.status_code})
-            print(f"[WARN] Failed to attach {action}")
+            print(f"[WARN] action {act} failed ({r.status_code})")
 
-    r_user = create_user(sess, base, new_user, new_user_pw, args.role_id)
-    if r_user.status_code in (200,201,204):
-        print(f"[OK] Created user {new_user}")
-        _save_password_for_user(new_user, new_user_pw)
-        print(f"[INFO] Saved password for {new_user} in {PW_STORE}")
+    r = create_user(sess, base, new_user, new_user_pw, a.role_id)
+    if r.status_code in (200,201,204):
+        print(f"[OK] User {new_user} created")
+        save_pw(new_user, new_user_pw)
     else:
-        print(f"[ERROR] User creation failed: {r_user.status_code} {r_user.text}")
+        print(f"[ERROR] User failed: {r.status_code} {r.text}")
         sys.exit(1)
 
-    print("\n[S U M M A R Y]")
-    print(f"HSM: {args.hsm_id} ({host}:{port})")
-    print(f"Firmware: {fw}")
-    print(f"Role: {args.role_id}")
-    print(f"Attached actions: {attached}")
-    if failures:
-        print(f"Failures: {failures}")
-    print(f"User: {new_user}")
     print("\n[COMPLETE]\n")
 
 if __name__ == "__main__":

@@ -58,7 +58,6 @@ def rest_login(sess, base, user, pw):
     if r.status_code not in (200,204):
         raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
 
-    # accept ANY cookie name returned
     cookies = sess.cookies.get_dict()
     if cookies:
         for k, v in cookies.items():
@@ -134,22 +133,28 @@ def main():
     }
     new_user = a.newuser or ENV_MAP[a.env]
 
-    admin_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
+    api_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
     new_user_pw = gen_pw()
 
     sess = requests.Session()
     sess.verify = False
 
-    # ⭐ ensure absolutely no headers before login
+    # no CT for login (previous version behavior)
     sess.headers.clear()
 
     print(f"[INFO] Connecting to {host}:{port} ...")
-    rest_login(sess, base, a.apiuser, admin_pw)
+    rest_login(sess, base, a.apiuser, api_pw)
 
     fw = detect_fw(sess, base)
+
+    # normalize FW to x.y.0
+    m = re.match(r"(\d+\.\d+)", fw)
+    if m:
+        fw = m.group(1) + ".0"
+    print(f"[INFO] Normalized FW: {fw}")
+
     ct = pick_ct(fw, vmap)
     sess.headers.update({"Content-Type": ct})
-
     print(f"[INFO] CT: {ct}")
 
     if fw not in amap:

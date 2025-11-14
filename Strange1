@@ -11,6 +11,9 @@ except ImportError:
 
 import argparse, json, os, getpass, secrets, string, re, datetime, sys
 
+# ----------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------
 RES_DIR = "resources"
 HSM_FILE = f"{RES_DIR}/hsm_mapping.json"
 VERSION_MAP_FILE = f"{RES_DIR}/version_map.json"
@@ -18,6 +21,9 @@ ROLE_MAP_FILE = f"{RES_DIR}/rest_role_actions.json"
 PW_STORE = f"{RES_DIR}/user_passwords.json"
 os.makedirs(RES_DIR, exist_ok=True)
 
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
 def load_json(path):
     if not os.path.exists(path):
         raise SystemExit(f"[ERROR] Missing: {path}")
@@ -25,8 +31,8 @@ def load_json(path):
         return json.load(f)
 
 def gen_pw(n=16):
-    a = string.ascii_letters + string.digits + "._-"
-    return ''.join(secrets.choice(a) for _ in a)
+    alphabet = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(alphabet) for _ in range(n))
 
 def save_pw(user, pw):
     data = {}
@@ -48,6 +54,9 @@ def save_pw(user, pw):
     except:
         pass
 
+# ----------------------------------------------------------------------
+# REST Ops
+# ----------------------------------------------------------------------
 def rest_login(sess, base, user, pw):
     r = sess.post(f"{base}/auth/session", auth=(user, pw), timeout=20)
     if r.status_code not in (200, 204):
@@ -73,20 +82,19 @@ def create_role(sess, base, rid, name):
                   json={"roleId": rid, "fullName": name},
                   timeout=20)
     if r.status_code not in (200, 201, 204):
-        r.raise_for_status()
-    print(f"[INFO] Role {rid} ok.")
+        raise SystemExit(f"[ERROR] Role create failed: {r.status_code} {r.text}")
+    print(f"[INFO] Role {rid} created.")
 
 def get_hsm_id(sess, base):
     r = sess.get(f"{base}/api/lunasa/hsms", timeout=20)
     r.raise_for_status()
     arr = r.json().get("hsms", [])
     if not arr:
-        raise SystemExit("[ERROR] No HSMs.")
+        raise SystemExit("[ERROR] No HSMs returned.")
     h = arr[0]
-
     hid = h.get("serialNumber") or h.get("id") or h.get("serial")
     if not hid:
-        raise SystemExit("[ERROR] Could not determine HSM ID.")
+        raise SystemExit("[ERROR] Cannot determine HSM ID.")
     print(f"[INFO] HSM ID: {hid}")
     return hid
 
@@ -101,6 +109,9 @@ def create_user(sess, base, uid, pw, role):
         timeout=20
     )
 
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--hsm-id", required=True)
@@ -112,11 +123,12 @@ def main():
     p.add_argument("--role-name", default="User Management Role")
     a = p.parse_args()
 
-    # load data files
+    # Load required files
     hmap = load_json(HSM_FILE)
     vmap = load_json(VERSION_MAP_FILE)
     amap = load_json(ROLE_MAP_FILE)
 
+    # HSM entry
     entry = next((h for h in hmap["hsms"] if h["id"] == a.hsm_id), None)
     if not entry:
         raise SystemExit("[ERROR] HSM id not in mapping file.")
@@ -125,23 +137,19 @@ def main():
     port = int(entry.get("port", 8443))
     base = f"https://{host}:{port}"
 
-    # use fwVersion from mapping.json BEFORE login
-    fw_file_version = entry.get("fwVersion")
-    if not fw_file_version:
-        raise SystemExit("[ERROR] fwVersion missing in mapping.json")
+    # Extract exact X.Y.Z from mapping fwVersion
+    fw_file = entry.get("fwVersion", "").strip()
+    m = re.match(r"(\d+\.\d+\.\d+)", fw_file)
+    if not m:
+        raise SystemExit(f"[ERROR] Cannot parse fwVersion in mapping: {fw_file}")
+    fw_norm = m.group(1)
 
-    m = re.match(r"(\d+\.\d+)", fw_file_version)
-    if m:
-        fw_norm = m.group(1) + ".0"
-    else:
-        fw_norm = fw_file_version
-
+    # Strict lookup in version_map.json
     if fw_norm not in vmap:
-        raise SystemExit(f"[ERROR] version_map.json missing entry for {fw_norm}")
+        raise SystemExit(f"[ERROR] version_map.json has no entry for {fw_norm}")
+    api_ver = vmap[fw_norm]
 
-    api_version = vmap[fw_norm]
-
-    # env user mapping
+    # Env → username
     ENV_MAP = {
         "DEV": "svc_at48994_usrmgt",
         "TE1": "svc_at48993_usrmgt",
@@ -157,54 +165,51 @@ def main():
     sess = requests.Session()
     sess.verify = False
 
-    # FIXED LOGIN CT
+    # Login CT from version_map
+    ct = f"application/vnd.safenetinc.lunasa+json;version={api_ver}"
     sess.headers.clear()
-    sess.headers.update({
-        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}"
-    })
+    sess.headers.update({"Content-Type": ct})
 
     print(f"[INFO] Connecting to {host}:{port} ...")
-    print(f"[INFO] Login CT: application/vnd.safenetinc.lunasa+json;version={api_version}")
+    print(f"[INFO] Login CT: {ct}")
 
     rest_login(sess, base, api_user, api_pw)
 
-    fw = detect_fw(sess, base)
+    fw_runtime = detect_fw(sess, base)
 
-    # after login, keep same CT for all calls
-    ct = f"application/vnd.safenetinc.lunasa+json;version={api_version}"
     sess.headers.update({"Content-Type": ct})
     print(f"[INFO] CT: {ct}")
 
     if fw_norm not in amap:
-        raise SystemExit("[ERROR] Firmware action map missing.")
+        raise SystemExit("[ERROR] No action map for this firmware.")
 
     actions = amap[fw_norm]
     print(f"[INFO] Actions: {actions}")
 
-    # create role
+    # Create role
     create_role(sess, base, a.role_id, a.role_name)
 
-    # get HSM ID
+    # Get HSM ID
     hid = get_hsm_id(sess, base)
 
-    # attach actions
+    # Attach actions
     for act in actions:
         r = attach_action(sess, base, hid, a.role_id, act)
         if r.status_code in (200, 201, 204):
-            print(f"[OK] action {act}")
+            print(f"[OK] {act}")
         else:
-            print(f"[WARN] action {act} failed ({r.status_code})")
+            print(f"[WARN] {act} failed: {r.status_code}")
 
-    # create user
+    # Create user
     r = create_user(sess, base, new_user, new_user_pw, a.role_id)
     if r.status_code in (200, 201, 204):
-        print(f"[OK] User {new_user} created")
+        print(f"[OK] User {new_user} created.")
         save_pw(new_user, new_user_pw)
     else:
-        print(f"[ERROR] User failed: {r.status_code} {r.text}")
-        sys.exit(1)
+        raise SystemExit(f"[ERROR] User create failed: {r.status_code} {r.text}")
 
     print("\n[COMPLETE]\n")
+
 
 if __name__ == "__main__":
     main()

@@ -1,71 +1,63 @@
 #!/usr/bin/env python3
 """
-um_rest_api.py
+Luna HSM User Management Automation (REST, Version-Aware)
+----------------------------------------------------------------------
+v1 REST Spec — Non-interactive + Env-based Username Mapping
+----------------------------------------------------------------------
 
-Luna HSM REST User Management Automation (final)
+Features:
+  • Reads resources/hsm_mapping.json
+  • Reads resources/version_map.json
+  • Reads resources/rest_role_actions.json
+  • REST-only: login, create role, attach actions, create user
+  • Auto-installs dependency 'requests' if missing
+  • Saves generated passwords to resources/user_passwords.json (600)
+----------------------------------------------------------------------
 
-Behavior:
- - Non-interactive CLI (falls back to prompt if password omitted)
- - Env-based new-user mapping (DEV|TE1|TE2|PROD) — same names you provided
- - Strictly tries the API endpoints and payload shapes shown in your screenshots
- - Mandatory certificate flow (CSR -> upload -> restart) attempted using the API variants
- - Creates the REST user, assigns role, stores generated password to resources/user_passwords.json
- - Installs `requests` if missing
-
-Usage example:
-  python3 um_rest_api.py --hsm-id hsm01 --env DEV --apiuser admin --apipassword <pw>
+Usage:
+  python3 rest_user_mgmt.py --hsm-id <id> --env DEV --admin admin \
+         --admin-pw <pw> --newuser <user> --newuser-pw <pw>
+----------------------------------------------------------------------
 """
 
+# ----------------------------------------------------------------------
+# Auto-install dependencies (requests)
+# ----------------------------------------------------------------------
+try:
+    import requests
+except ImportError:
+    import subprocess, sys
+    print("[INFO] Installing missing dependency: requests ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
+
 import argparse
-import os
-import sys
 import json
+import os
 import datetime
 import secrets
 import string
-import tempfile
-import getpass
-import subprocess
-from typing import Tuple
-
-# ensure requests is available
-try:
-    import requests
-    import urllib3
-except Exception:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
-    import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import re
+import sys
 
 # ----------------------------------------------------------------------
-# constants / paths
+# Constants and resource paths
 # ----------------------------------------------------------------------
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+VERSION_MAP_FILE = os.path.join(RES_DIR, "version_map.json")
+ROLE_MAP_FILE = os.path.join(RES_DIR, "rest_role_actions.json")
 PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 os.makedirs(RES_DIR, exist_ok=True)
 
-FIXED_ROLE_NAME = "user_mgmt_role"
-CT_V10 = "application/vnd.safenetinc.lunasa+json;version=10"
-CT_V7 = "application/vnd.safenetinc.lunasa+json;version=7"
-
-ENV_USER_MAP = {
-    "DEV": "svc_at48994_usrmgt",
-    "TE1": "svc_at48993_usrmgt",
-    "TE2": "svc_at48992_usrmgt",
-    "PROD": "svc_at49008_usrmgt"
-}
-
 # ----------------------------------------------------------------------
-# helpers: password generation + storage
+# Helpers: password generation & storage
 # ----------------------------------------------------------------------
-def _generate_temp_password(length: int = 16) -> str:
+def _generate_temp_password(length=16):
     alphabet = string.ascii_letters + string.digits + "._-"
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def _save_password_for_user(username: str, password: str, category: str = "rest") -> None:
+def _save_password_for_user(username, password):
     data = {}
     if os.path.exists(PW_STORE):
         try:
@@ -73,10 +65,7 @@ def _save_password_for_user(username: str, password: str, category: str = "rest"
                 data = json.load(f)
         except Exception:
             data = {}
-    # keep luna shell compatibility: store under a bucket (category) to avoid collisions
-    if category not in data:
-        data[category] = {}
-    data[category][username] = {"password": password, "created_at": datetime.datetime.utcnow().isoformat() + "Z"}
+    data[username] = {"password": password, "created_at": datetime.datetime.utcnow().isoformat() + "Z"}
     tmp = PW_STORE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -87,332 +76,172 @@ def _save_password_for_user(username: str, password: str, category: str = "rest"
         pass
 
 # ----------------------------------------------------------------------
-# load mapping
+# JSON loader
 # ----------------------------------------------------------------------
-def load_hsm(hsm_id: str) -> dict:
-    if not os.path.exists(HSM_FILE):
-        raise SystemExit(f"[ERROR] Missing mapping file: {HSM_FILE}")
-    with open(HSM_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for h in data.get("hsms", []):
-        if h.get("id") == hsm_id:
-            return h
-    raise SystemExit(f"[ERROR] HSM id '{hsm_id}' not found in mapping.")
+def load_json(path):
+    if not os.path.exists(path):
+        raise SystemExit(f"[ERROR] Missing mapping file: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 # ----------------------------------------------------------------------
-# HTTP wrappers with diagnostics
+# Content-Type selector using version_map.json
 # ----------------------------------------------------------------------
-def try_post(session: requests.Session, url: str, **kwargs) -> Tuple[int, str]:
-    try:
-        r = session.post(url, verify=False, timeout=30, **kwargs)
-        return r.status_code, r.text or ""
-    except Exception as e:
-        return -1, f"exception:{e}"
-
-def try_put(session: requests.Session, url: str, **kwargs) -> Tuple[int, str]:
-    try:
-        r = session.put(url, verify=False, timeout=60, **kwargs)
-        return r.status_code, r.text or ""
-    except Exception as e:
-        return -1, f"exception:{e}"
-
-def try_get(session: requests.Session, url: str, **kwargs) -> Tuple[int, str]:
-    try:
-        r = session.get(url, verify=False, timeout=20, **kwargs)
-        return r.status_code, r.text or ""
-    except Exception as e:
-        return -1, f"exception:{e}"
-
-# ----------------------------------------------------------------------
-# login (supports 204 and cookie flows)
-# ----------------------------------------------------------------------
-def rest_login(session: requests.Session, base_url: str, user: str, pwd: str) -> Tuple[bool, dict]:
-    """
-    Tries login with v10 Content-Type header first, accepts 200/201/204.
-    If cookie-based session is returned, store it in session.cookies (requests does that automatically).
-    Returns (ok, response_json_if_any)
-    """
-    url = f"{base_url}/auth/session"
-    headers = {"Content-Type": CT_V10}
-    # prefer Basic auth on the session object (some HSMs accept 204 w/out cookie)
-    # We'll attach auth per-request as fallback to ensure credentials are used
-    try:
-        # direct POST with auth tuple (works with curl -u)
-        r = session.post(url, auth=(user, pwd), headers=headers, verify=False, timeout=20)
-    except Exception as e:
-        return False, {"error": str(e)}
-
-    if r.status_code in (200, 201, 204):
-        print(f"[INFO] Login succeeded (status: {r.status_code})")
-        # if JSON returned, return it
-        try:
-            return True, r.json()
-        except Exception:
-            return True, {}
-    # try v7 header fallback
-    try:
-        r2 = session.post(url, auth=(user, pwd), headers={"Content-Type": CT_V7}, verify=False, timeout=20)
-    except Exception as e:
-        return False, {"error": str(e)}
-
-    if r2.status_code in (200, 201, 204):
-        print(f"[INFO] Login succeeded with v7 header (status: {r2.status_code})")
-        try:
-            return True, r2.json()
-        except Exception:
-            return True, {}
-    # not accepted: return both bodies for debugging
-    print(f"[ERROR] Login failed: {r.status_code} / {r2.status_code}")
-    print(f"[DEBUG] body1: {r.text[:400]}")
-    print(f"[DEBUG] body2: {r2.text[:400]}")
-    return False, {"body1": r.text, "body2": r2.text}
+def pick_content_type_for_fw(version_text, version_map):
+    v = version_text.strip()
+    if not v:
+        raise SystemExit("[ERROR] Empty firmware version string.")
+    # exact match
+    if v in version_map:
+        token = version_map[v]
+        return f"application/vnd.safenetinc.lunasa+json;version={token}"
+    # try major.minor.0 fallback
+    m = re.match(r"(\d+\.\d+)", v)
+    if m:
+        mm = m.group(1)
+        cand = mm + ".0"
+        if cand in version_map:
+            print(f"[WARN] Using fallback version key {cand} for detected {v}")
+            return f"application/vnd.safenetinc.lunasa+json;version={version_map[cand]}"
+        if mm in version_map:
+            print(f"[WARN] Using fallback version key {mm} for detected {v}")
+            return f"application/vnd.safenetinc.lunasa+json;version={version_map[mm]}"
+    raise SystemExit(f"[ERROR] No content-type mapping for firmware: {v}")
 
 # ----------------------------------------------------------------------
-# certificate flow (mandatory)
-# tries the exact endpoints/patterns from your screenshots in order
+# REST wrappers
 # ----------------------------------------------------------------------
-def certificate_flow(session: requests.Session, base_url: str) -> bool:
-    """
-    Sequence (strict):
-      1) Try GET/POST on /api/lunasa/webServer/certificate/actions (probe)
-      2) Try generate CSR at /api/lunasa/webServer/csr (v10) or /api/lunasa/webServer/csr?version=7
-      3) If CSR obtained, upload to /api/lunasa/webServer/certificate via PUT (v10 octet-stream)
-      4) For 7.8+ use /api/lunasa/services/webserver/actions/restart (POST)
-    This function will raise only if a necessary step absolutely fails (CSR generation/upload).
-    """
-    # 1) probe actions endpoints (not guaranteed to exist on all builds)
-    probe_candidates = [
-        f"{base_url}/api/lunasa/webServer/certificate/actions",
-        f"{base_url}/api/lunasa/services/webserver/actions",
-        f"{base_url}/api/lunasa/services/webserver/actions/restart"
-    ]
-    for p in probe_candidates:
-        code, body = try_get(session, p, headers={"Content-Type": CT_V10})
-        print(f"[DEBUG] probe GET {p} -> {code}")
-        if code == 200:
-            # try POST to trigger if applicable
-            pcode, pbody = try_post(session, p, headers={"Content-Type": CT_V10}, json={})
-            print(f"[INFO] POST {p} -> {pcode}")
-            if pcode in (200, 201, 204):
-                return True
-    # 2) generate CSR (required step)
-    csr_candidates = [
-        f"{base_url}/api/lunasa/webServer/csr",
-        f"{base_url}/api/lunasa/webServer/csr?version=10",
-        f"{base_url}/api/lunasa/webServer/csr?version=7"
-    ]
-    csr_text = None
-    csr_path = None
-    for c in csr_candidates:
-        print(f"[DEBUG] Attempting CSR generation: {c}")
-        code, body = try_post(session, c, headers={"Content-Type": CT_V10}, json={"keyType": "rsa", "keySize": 2048, "cn": base_url})
-        print(f"[DEBUG] CSR POST {c} -> {code}")
-        if code in (200, 201):
-            csr_text = body
-            break
-    if not csr_text:
-        # some builds return CSR via GET after POST trigger - try GET
-        for c in csr_candidates:
-            code, body = try_get(session, c, headers={"Content-Type": CT_V10})
-            print(f"[DEBUG] CSR GET {c} -> {code}")
-            if code in (200, 201):
-                csr_text = body
-                break
-    if not csr_text:
-        # fail: CSR generation not available
-        print("[ERROR] CSR generation failed for all tried endpoints.")
-        return False
+def rest_login(sess, base, admin, admin_pw):
+    r = sess.post(f"{base}/auth/session", auth=(admin, admin_pw), timeout=20)
+    if r.status_code not in (200, 204):
+        raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
+    print("[INFO] Login successful (SESSION_ID cookie stored).")
 
-    # save CSR to temp file so we can PUT as binary (mimic curl --data-binary @file)
-    csr_path = os.path.join(RES_DIR, "auto_generated.csr.pem")
-    with open(csr_path, "w", encoding="utf-8") as f:
-        f.write(csr_text)
+def detect_firmware(sess, base):
+    r = sess.get(f"{base}/api/lunasa", timeout=20)
+    r.raise_for_status()
+    ver = r.json().get("version", "").strip()
+    if not ver:
+        raise SystemExit("[ERROR] Firmware version not found in /api/lunasa")
+    print(f"[INFO] Detected firmware version: {ver}")
+    return ver
 
-    # 3) upload certificate - PUT to certificate endpoints
-    cert_put_candidates = [
-        f"{base_url}/api/lunasa/webServer/certificate",
-        f"{base_url}/api/lunasa/webServer/certificate?version=10",
-        f"{base_url}/api/lunasa/services/webserver/certificate"
-    ]
-    for cp in cert_put_candidates:
-        print(f"[DEBUG] Attempting certificate upload to {cp}")
-        try:
-            with open(csr_path, "rb") as fh:
-                files = {"file": fh}
-                # some HSMs expect octet-stream and no JSON; emulate curl --data-binary
-                code, body = try_put(session, cp, headers={"Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10"}, data=fh.read())
-            print(f"[DEBUG] PUT {cp} -> {code}")
-            if code in (200, 201, 204):
-                # optionally restart webserver for certain versions
-                for restart_p in (f"{base_url}/api/lunasa/services/webserver/actions/restart",):
-                    rcode, rbody = try_post(session, restart_p, headers={"Content-Type": CT_V10}, json={})
-                    print(f"[DEBUG] restart POST {restart_p} -> {rcode}")
-                return True
-        except Exception as e:
-            print(f"[WARN] upload attempt exception {e}")
-            continue
+def create_role(sess, base, role_id, role_name):
+    payload = {"roleId": role_id, "fullName": role_name}
+    r = sess.post(f"{base}/api/lunasa/roles", json=payload, timeout=20)
+    if r.status_code not in (200,201,204):
+        r.raise_for_status()
+    print(f"[INFO] Role '{role_id}' created or already exists.")
 
-    print("[ERROR] Certificate upload failed for all tried endpoints.")
-    return False
+def get_hsm_id(sess, base):
+    r = sess.get(f"{base}/api/lunasa/hsms", timeout=20)
+    r.raise_for_status()
+    arr = r.json().get("hsms", [])
+    if not arr:
+        raise SystemExit("[ERROR] /api/lunasa/hsms returned no devices")
+    h = arr[0]
+    hsm_id = h.get("serialNumber") or h.get("id") or h.get("serial")
+    if not hsm_id:
+        raise SystemExit("[ERROR] Could not extract HSM serial from /hsms response")
+    print(f"[INFO] Using HSM ID: {hsm_id}")
+    return hsm_id
+
+def attach_action(sess, base, hsm_id, role_id, action_id):
+    return sess.post(f"{base}/api/lunasa/hsms/{hsm_id}/roles/{role_id}/actions/{action_id}", timeout=20)
+
+def create_user(sess, base, user_id, password, role):
+    payload = {"userId": user_id, "password": password, "role": role}
+    return sess.post(f"{base}/api/lunasa/users", json=payload, timeout=20)
 
 # ----------------------------------------------------------------------
-# create REST user (tries payload variants shown)
-# ----------------------------------------------------------------------
-def create_rest_user(session: requests.Session, base_url: str, username: str) -> str:
-    """
-    Try payload shapes:
-      - {"userId": "...", "role":"user_mgmt_role", "password":"pw"}  (screenshot)
-      - {"user": "...", "password":"pw", "confirmPassword":"pw"}     (alternate shape)
-      - fallback to /users /api/users paths
-    On success returns generated password string (also saved locally).
-    """
-    pw = _generate_temp_password()
-    attempts = []
-
-    url_main = f"{base_url}/api/lunasa/users"
-    payload_a = {"userId": username, "role": FIXED_ROLE_NAME, "password": pw}
-    payload_b = {"user": username, "password": pw, "confirmPassword": pw}
-
-    # try main variant A
-    code, body = try_post(session, url_main, json=payload_a, headers={"Content-Type": CT_V10})
-    print(f"[TRY] POST {url_main} (payloadA) -> {code}")
-    attempts.append((url_main, code, body))
-    if code in (200, 201):
-        _save_password_for_user(username, pw)
-        return pw
-
-    # try main variant B
-    code, body = try_post(session, url_main, json=payload_b, headers={"Content-Type": CT_V10})
-    print(f"[TRY] POST {url_main} (payloadB) -> {code}")
-    attempts.append((url_main, code, body))
-    if code in (200, 201):
-        _save_password_for_user(username, pw)
-        return pw
-
-    # alternate paths
-    alt_paths = [
-        f"{base_url}/users",
-        f"{base_url}/api/users",
-        f"{base_url}/api/lunasa/users?version=7"
-    ]
-    for p in alt_paths:
-        code, body = try_post(session, p, json=payload_a, headers={"Content-Type": CT_V10})
-        print(f"[TRY] POST {p} (payloadA) -> {code}")
-        attempts.append((p, code, body))
-        if code in (200, 201):
-            _save_password_for_user(username, pw)
-            return pw
-        code, body = try_post(session, p, json=payload_b, headers={"Content-Type": CT_V10})
-        print(f"[TRY] POST {p} (payloadB) -> {code}")
-        attempts.append((p, code, body))
-        if code in (200, 201):
-            _save_password_for_user(username, pw)
-            return pw
-
-    # nothing worked
-    print("[ERROR] User creation failed. Attempts:")
-    for u, c, b in attempts:
-        print(f"  {u} -> {c} | {str(b)[:200]}")
-    raise SystemExit("[FATAL] All user creation attempts failed.")
-
-# ----------------------------------------------------------------------
-# assign role (tries assignment endpoints)
-# ----------------------------------------------------------------------
-def assign_role(session: requests.Session, base_url: str, username: str, role_name: str) -> bool:
-    """
-    Attempts a variety of patterns for assigning/importing roles:
-    - PUT /api/lunasa/roles/{role}/users/{username}
-    - POST /api/lunasa/users with role field
-    - PUT /api/lunasa/users/{username}/roles/{role}
-    """
-    tries = []
-
-    p1 = f"{base_url}/api/lunasa/roles/{role_name}/users/{username}"
-    code, body = try_put(session, p1, headers={"Content-Type": CT_V10})
-    print(f"[TRY] PUT {p1} -> {code}")
-    tries.append((p1, code, body))
-    if code in (200, 201, 204):
-        return True
-
-    p2 = f"{base_url}/api/lunasa/users"
-    payload = {"userId": username, "role": role_name}
-    code, body = try_post(session, p2, json=payload, headers={"Content-Type": CT_V10})
-    print(f"[TRY] POST {p2} (assign role payload) -> {code}")
-    tries.append((p2, code, body))
-    if code in (200, 201, 204):
-        return True
-
-    alt_patterns = [
-        f"{base_url}/api/lunasa/users/{username}/roles/{role_name}",
-        f"{base_url}/users/{username}/roles/{role_name}",
-        f"{base_url}/api/users/{username}/roles/{role_name}"
-    ]
-    for p in alt_patterns:
-        code, body = try_put(session, p, headers={"Content-Type": CT_V10})
-        print(f"[TRY] PUT {p} -> {code}")
-        tries.append((p, code, body))
-        if code in (200, 201, 204):
-            return True
-
-    print("[WARN] Role assignment attempts finished; none succeeded. Details:")
-    for u, c, b in tries:
-        print(f"  {u} -> {c} | {str(b)[:200]}")
-    return False
-
-# ----------------------------------------------------------------------
-# main
+# Main
 # ----------------------------------------------------------------------
 def main():
-    p = argparse.ArgumentParser(description="Luna HSM REST user mgmt (final)")
-    p.add_argument("--hsm-id", required=True, help="HSM ID from resources/hsm_mapping.json")
-    p.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"], type=str.upper)
-    p.add_argument("--apiuser", default="admin", help="API login user (default: admin)")
-    p.add_argument("--apipassword", help="API login password (optional; will prompt if omitted)")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Luna HSM REST user management")
+    parser.add_argument("--hsm-id", required=True)
+    parser.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"], type=str.upper)
+    parser.add_argument("--admin", default="admin")
+    parser.add_argument("--admin-pw", required=True)
+    parser.add_argument("--newuser")
+    parser.add_argument("--newuser-pw")
+    parser.add_argument("--role-id", default="user_mgmt_role")
+    parser.add_argument("--role-name", default="User Management Role")
+    args = parser.parse_args()
 
-    env = args.env.upper()
-    new_user = ENV_USER_MAP.get(env)
-    if not new_user:
-        raise SystemExit("[ERROR] unsupported env")
+    hsm_map = load_json(HSM_FILE)
+    version_map = load_json(VERSION_MAP_FILE)
+    role_map = load_json(ROLE_MAP_FILE)
 
-    admin_user = args.apiuser
-    admin_pwd = args.apipassword or getpass.getpass(f"Password for {admin_user}@HSM API: ")
+    hsm_entry = next((h for h in hsm_map.get("hsms", []) if h.get("id") == args.hsm_id), None)
+    if not hsm_entry:
+        raise SystemExit(f"[ERROR] HSM id '{args.hsm_id}' not found.")
 
-    # load mapping
-    hsm = load_hsm(args.hsm_id)
-    host = hsm.get("ipAddress") or hsm.get("host")
-    if not host:
-        raise SystemExit("[ERROR] mapping entry missing host/ip")
-    base_url = f"https://{host}:8443"
+    host = hsm_entry.get("ipAddress") or hsm_entry.get("host")
+    port = int(hsm_entry.get("port", 8443))
+    base = f"https://{host}:{port}"
 
-    session = requests.Session()
-    # set session auth to allow 204/no-cookie style logins (requests will send basic auth per-request)
-    session.auth = (admin_user, admin_pwd)
+    ENV_USER_MAP = {
+        "DEV": "svc_at48994_usrmgt",
+        "TE1": "svc_at48993_usrmgt",
+        "TE2": "svc_at48992_usrmgt",
+        "PROD": "svc_at49008_usrmgt"
+    }
 
-    ok, info = rest_login(session, base_url, admin_user, admin_pwd)
-    if not ok:
-        raise SystemExit("[ERROR] login failed; check credentials and endpoint")
+    new_user = args.newuser or ENV_USER_MAP[args.env]
+    new_user_pw = args.newuser_pw or _generate_temp_password()
 
-    # mandatory certificate flow: if it fails, abort because you said certificate is required
-    print("[INFO] Running certificate flow (mandatory)...")
-    cert_ok = certificate_flow(session, base_url)
-    if not cert_ok:
-        raise SystemExit("[ERROR] certificate flow failed. aborting.")
+    sess = requests.Session()
+    sess.verify = False
+    sess.headers.update({"Content-Type": "application/json"})
 
-    # create user (raises on failure)
-    print(f"[INFO] Creating REST user '{new_user}' ...")
-    pw = create_rest_user(session, base_url, new_user)
-    print(f"[INFO] Created user '{new_user}' with generated password saved locally.")
+    print(f"[INFO] Connecting to {host}:{port} as {args.admin} ...")
+    rest_login(sess, base, args.admin, args.admin_pw)
 
-    # assign role (best-effort; reports if failed)
-    print(f"[INFO] Assigning role '{FIXED_ROLE_NAME}' to '{new_user}' ...")
-    role_ok = assign_role(session, base_url, new_user, FIXED_ROLE_NAME)
-    if role_ok:
-        print("[SUCCESS] Role assigned.")
+    fw = detect_firmware(sess, base)
+
+    ct_header = pick_content_type_for_fw(fw, version_map)
+    sess.headers.update({"Content-Type": ct_header})
+    print(f"[INFO] Using Content-Type header: {ct_header}")
+
+    if fw not in role_map:
+        raise SystemExit(f"[ERROR] Firmware '{fw}' not present in {ROLE_MAP_FILE}")
+
+    actions = role_map[fw]
+    print(f"[INFO] Actions to attach for {fw}: {actions}")
+
+    create_role(sess, base, args.role_id, args.role_name)
+
+    hsm_id = get_hsm_id(sess, base)
+
+    attached = []
+    failures = []
+    for action in actions:
+        r = attach_action(sess, base, hsm_id, args.role_id, action)
+        if r.status_code in (200,201,204):
+            attached.append(action)
+            print(f"[OK] Attached action {action}")
+        else:
+            failures.append({"action": action, "status": r.status_code})
+            print(f"[WARN] Failed to attach {action}")
+
+    r_user = create_user(sess, base, new_user, new_user_pw, args.role_id)
+    if r_user.status_code in (200,201,204):
+        print(f"[OK] Created user {new_user}")
+        _save_password_for_user(new_user, new_user_pw)
+        print(f"[INFO] Saved password for {new_user} in {PW_STORE}")
     else:
-        print("[WARN] Role assignment did not succeed. See debug attempts above.")
+        print(f"[ERROR] User creation failed: {r_user.status_code} {r_user.text}")
+        sys.exit(1)
 
-    print(f"\n✅ Completed for HSM {args.hsm_id} ({env}). New REST user: {new_user}\n")
+    print("\n[S U M M A R Y]")
+    print(f"HSM: {args.hsm_id} ({host}:{port})")
+    print(f"Firmware: {fw}")
+    print(f"Role: {args.role_id}")
+    print(f"Attached actions: {attached}")
+    if failures:
+        print(f"Failures: {failures}")
+    print(f"User: {new_user}")
+    print("\n[COMPLETE]\n")
 
 if __name__ == "__main__":
     main()

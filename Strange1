@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Luna HSM User Management (REST, version-aware)
+Luna HSM User Management (REST)
 """
 try:
     import requests
@@ -31,14 +31,11 @@ def gen_pw(n=16):
 def save_pw(user, pw):
     data = {}
     if os.path.exists(PW_STORE):
-        try:
-            data = json.load(open(PW_STORE))
-        except:
-            data = {}
+        try: data = json.load(open(PW_STORE))
+        except: data = {}
     data[user] = {"password": pw, "created_at": datetime.datetime.utcnow().isoformat()+"Z"}
     tmp = PW_STORE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
+    with open(tmp, "w") as f: json.dump(data, f, indent=2)
     os.replace(tmp, PW_STORE)
     try: os.chmod(PW_STORE, 0o600)
     except: pass
@@ -60,40 +57,41 @@ def rest_login(sess, base, user, pw):
     r = sess.post(f"{base}/auth/session", auth=(user, pw), timeout=20)
     if r.status_code not in (200,204):
         raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
-    sid = None
-    c = sess.cookies.get_dict()
-    if "SESSION_ID" in c: sid = c["SESSION_ID"]
-    try:
-        j = r.json()
-        if not sid:
-            sid = j.get("sessionId") or j.get("SESSION_ID") or j.get("id")
-    except: pass
-    if sid:
-        sess.headers.update({"Cookie": f"SESSION_ID={sid}"})
+
+    # accept ANY cookie name returned
+    cookies = sess.cookies.get_dict()
+    if cookies:
+        for k, v in cookies.items():
+            sess.headers.update({"Cookie": f"{k}={v}"})
+
     print("[INFO] Login ok.")
 
 def detect_fw(sess, base):
     r = sess.get(f"{base}/api/lunasa", timeout=20)
     r.raise_for_status()
     v = r.json().get("version","").strip()
-    if not v: raise SystemExit("[ERROR] No version.")
+    if not v:
+        raise SystemExit("[ERROR] No firmware version.")
     print(f"[INFO] Firmware: {v}")
     return v
 
 def create_role(sess, base, rid, name):
     r = sess.post(f"{base}/api/lunasa/roles",
                   json={"roleId": rid, "fullName": name}, timeout=20)
-    if r.status_code not in (200,201,204): r.raise_for_status()
+    if r.status_code not in (200,201,204):
+        r.raise_for_status()
     print(f"[INFO] Role {rid} ok.")
 
 def get_hsm_id(sess, base):
     r = sess.get(f"{base}/api/lunasa/hsms", timeout=20)
     r.raise_for_status()
     arr = r.json().get("hsms",[])
-    if not arr: raise SystemExit("[ERROR] No HSMs.")
+    if not arr:
+        raise SystemExit("[ERROR] No HSMs.")
     h = arr[0]
     hid = h.get("serialNumber") or h.get("id") or h.get("serial")
-    if not hid: raise SystemExit("[ERROR] No HSM id.")
+    if not hid:
+        raise SystemExit("[ERROR] No HSM id.")
     print(f"[INFO] HSM ID: {hid}")
     return hid
 
@@ -121,16 +119,17 @@ def main():
     amap = load_json(ROLE_MAP_FILE)
 
     entry = next((h for h in hmap["hsms"] if h["id"] == a.hsm_id), None)
-    if not entry: raise SystemExit("[ERROR] HSM not found.")
+    if not entry:
+        raise SystemExit("[ERROR] HSM not found.")
 
     host = entry.get("ipAddress") or entry.get("host")
     port = int(entry.get("port", 8443))
     base = f"https://{host}:{port}"
 
     ENV_MAP = {
-        "DEV": "svc_at48994_usrmgt",
-        "TE1": "svc_at48993_usrmgt",
-        "TE2": "svc_at48992_usrmgt",
+        "DEV":  "svc_at48994_usrmgt",
+        "TE1":  "svc_at48993_usrmgt",
+        "TE2":  "svc_at48992_usrmgt",
         "PROD": "svc_at49008_usrmgt"
     }
     new_user = a.newuser or ENV_MAP[a.env]
@@ -141,16 +140,20 @@ def main():
     sess = requests.Session()
     sess.verify = False
 
+    # ⭐ ensure absolutely no headers before login
+    sess.headers.clear()
+
     print(f"[INFO] Connecting to {host}:{port} ...")
     rest_login(sess, base, a.apiuser, admin_pw)
 
     fw = detect_fw(sess, base)
     ct = pick_ct(fw, vmap)
     sess.headers.update({"Content-Type": ct})
+
     print(f"[INFO] CT: {ct}")
 
     if fw not in amap:
-        raise SystemExit("[ERROR] Missing action map for this firmware.")
+        raise SystemExit("[ERROR] Firmware action map missing.")
 
     actions = amap[fw]
     print(f"[INFO] Actions: {actions}")

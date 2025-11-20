@@ -1,0 +1,23 @@
+GET:/api/lunasa/users,
+POST:/api/lunasa/users,
+DELETE:/api/lunasa/users/{userId},
+PUT:/api/lunasa/users/{userId}/enable,
+PUT:/api/lunasa/users/{userId}/disable,
+PUT:/api/lunasa/users/{userId}/password,
+
+# role listing & querying
+GET:/api/lunasa/roles,
+GET:/api/lunasa/roles/{roleId},
+
+# role membership (user role add/delete)
+PUT:/api/lunasa/roles/{roleId}/users,       
+DELETE:/api/lunasa/roles/{roleId}/users/{userId},
+
+# role import / resources file
+PUT:/roles/{roleId}/resources,
+GET:/roles/{roleId}/resources,
+DELETE:/roles/{roleId}/resources,
+
+# radius (7.7+)
+POST:/api/lunasa/users/{userId}/radius,
+DELETE:/api/lunasa/users/{userId}/radius/{radiusId},

@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-User Management Automation (REST)
----------------------------------
-Creates custom role and assigns it to a user.
-Uses version map for REST API versions.
+Luna HSM User Management (REST)
 """
 
-# dependencies
+# install requests if missing
 try:
     import requests
 except ImportError:
@@ -14,25 +11,19 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-import argparse
-import os
-import json
-import getpass
-import secrets
-import string
-import datetime
-import sys
-import re
-import tempfile
+import argparse, json, os, getpass, secrets, string, re, datetime, sys
 
-# resource paths
-RES_DIR = "resources"
-HSM_FILE = f"{RES_DIR}/hsm_mapping.json"
-VERSION_MAP_FILE = f"{RES_DIR}/version_map.json"
-ROLE_RESOURCE_FILE = f"{RES_DIR}/custom_role_resources.json"
-PW_STORE = f"{RES_DIR}/user_passwords.json"
+# paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RES_DIR = os.path.join(BASE_DIR, "resources")
+
+HSM_FILE = os.path.join(RES_DIR, "hsm_mapping")
+VERSION_MAP_FILE = os.path.join(RES_DIR, "version_map")
+CUSTOM_ROLE_FILE = os.path.join(RES_DIR, "custom_role_resources")
+PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 
 os.makedirs(RES_DIR, exist_ok=True)
+
 
 def load_json(path):
     if not os.path.exists(path):
@@ -40,11 +31,13 @@ def load_json(path):
     with open(path, "r") as f:
         return json.load(f)
 
-def gen_pw(n=16):
-    chars = string.ascii_letters + string.digits + "._-"
-    return ''.join(secrets.choice(chars) for _ in range(n))
 
-def save_pw(username, pw):
+def gen_pw(n=16):
+    a = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(a) for _ in range(n))
+
+
+def save_pw(user, pw):
     data = {}
     if os.path.exists(PW_STORE):
         try:
@@ -52,121 +45,127 @@ def save_pw(username, pw):
                 data = json.load(f)
         except:
             data = {}
-    data[username] = {"password": pw, "created_at": datetime.datetime.utcnow().isoformat()+"Z"}
+
+    data[user] = {
+        "password": pw,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    }
+
     tmp = PW_STORE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, PW_STORE)
+
     try:
         os.chmod(PW_STORE, 0o600)
     except:
         pass
 
-def extract_xyz(text):
-    m = re.search(r"(\d+\.\d+\.\d+)", text)
-    return m.group(1) if m else None
 
-def pick_ct_version(fw, vmap):
-    if fw in vmap:
-        return vmap[fw]
-    mm = ".".join(fw.split(".")[:2])  # 7.8
-    if mm in vmap:
-        return vmap[mm]
-    if mm+".0" in vmap:
-        return vmap[mm+".0"]
-    return None
+def pick_ct(version, vmap):
+    v = version.strip()
 
-def rest_login(sess, base, user, pw, ctver):
-    hdr = {}
-    if ctver:
-        hdr["Content-Type"] = f"application/vnd.safenetinc.lunasa+json;version={ctver}"
-    r = sess.post(f"{base}/auth/session", auth=(user, pw), headers=hdr, timeout=20)
-    if r.status_code not in (200,204):
+    # exact match first
+    if v in vmap:
+        return f"application/vnd.safenetinc.lunasa+json;version={vmap[v]}"
+
+    # match 7.x pattern
+    m = re.match(r"(\d+\.\d+\.\d+)", v)
+    if m:
+        mm = m.group(1)
+        if mm in vmap:
+            return f"application/vnd.safenetinc.lunasa+json;version={vmap[mm]}"
+
+    # match 7.x only
+    m2 = re.match(r"(\d+\.\d+)", v)
+    if m2:
+        mm = m2.group(1)
+        if mm in vmap:
+            return f"application/vnd.safenetinc.lunasa+json;version={vmap[mm]}"
+
+    raise SystemExit(f"[ERROR] No REST API version mapping for firmware {v}")
+
+
+def rest_login(sess, base, user, pw):
+    r = sess.post(f"{base}/auth/session", auth=(user, pw), timeout=20)
+    if r.status_code not in (200, 204):
         raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
-    cookies = r.cookies.get_dict()
-    for k,v in cookies.items():
-        sess.headers.update({"Cookie": f"{k}={v}"})
-        break
+
+    cookies = sess.cookies.get_dict()
+    if cookies:
+        for k, v in cookies.items():
+            sess.headers.update({"Cookie": f"{k}={v}"})
+
+    print("[INFO] login ok.")
+
 
 def detect_fw(sess, base):
     r = sess.get(f"{base}/api/lunasa", timeout=20)
     r.raise_for_status()
-    return r.json().get("version","").strip()
+    fw = r.json().get("version", "").strip()
+    if not fw:
+        raise SystemExit("[ERROR] firmware not found")
+    print(f"[INFO] firmware: {fw}")
+    return fw
 
-def create_role(sess, base, rid, name):
-    data = {"roleId": rid, "fullName": name}
-    r = sess.post(f"{base}/roles", json=data, timeout=20)
-    if r.status_code not in (200,201,204):
-        raise SystemExit(f"[ERROR] Role create failed: {r.status_code} {r.text}")
 
-def upload_resources(sess, base, rid, lines, ctver):
-    tmp = os.path.join(tempfile.gettempdir(), f"{rid}_resources.txt")
-    with open(tmp, "w") as f:
-        for line in lines:
-            f.write(line.rstrip(",") + "\n")
-
-    headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+octet-stream;version={ctver}"
+def create_role(sess, base, role_id, name, resources):
+    body = {
+        "roleId": role_id,
+        "fullName": name,
+        "resources": resources
     }
-    with open(tmp, "rb") as f:
-        r = sess.put(f"{base}/roles/{rid}/resources", data=f, headers=headers, timeout=30)
-    os.remove(tmp)
-    if r.status_code not in (200,204):
-        raise SystemExit(f"[ERROR] Resource upload failed: {r.status_code} {r.text}")
+    r = sess.post(f"{base}/api/lunasa/roles", json=body, timeout=20)
+    if r.status_code not in (200, 201, 204):
+        raise SystemExit(f"[ERROR] role create failed: {r.status_code} {r.text}")
+    print(f"[INFO] role {role_id} created.")
 
-def get_hsm_id(sess, base):
-    r = sess.get(f"{base}/api/lunasa/hsms", timeout=20)
-    r.raise_for_status()
-    arr = r.json().get("hsms", [])
-    if not arr:
-        raise SystemExit("[ERROR] No HSMs found.")
-    h = arr[0]
-    hid = h.get("serialNumber") or h.get("id") or h.get("serial")
-    if not hid:
-        raise SystemExit("[ERROR] No HSM ID.")
-    return hid
 
-def assign_role(sess, base, rid, user):
-    payload = {"users": [user]}
-    r = sess.put(f"{base}/api/lunasa/roles/{rid}/users", json=payload, timeout=20)
-    if r.status_code not in (200,204):
-        raise SystemExit(f"[ERROR] Role assign failed: {r.status_code} {r.text}")
+def create_user(sess, base, uid, pw, role):
+    body = {
+        "userId": uid,
+        "password": pw,
+        "role": role
+    }
+    r = sess.post(f"{base}/api/lunasa/users", json=body, timeout=20)
+    if r.status_code not in (200, 201, 204):
+        raise SystemExit(f"[ERROR] user create failed: {r.status_code} {r.text}")
 
-def create_user(sess, base, uid, pw, rid):
-    payload = {"userId": uid, "password": pw, "role": rid}
-    r = sess.post(f"{base}/api/lunasa/users", json=payload, timeout=20)
-    if r.status_code not in (200,201,204):
-        raise SystemExit(f"[ERROR] User create failed: {r.status_code} {r.text}")
+    print(f"[INFO] user {uid} created.")
+    return True
+
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Luna HSM User Management (REST)")
     p.add_argument("--hsm-id", required=True)
-    p.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"], type=str.upper)
+    p.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"], type=str.upper)
     p.add_argument("--apiuser", default="admin")
     p.add_argument("--apipw")
     p.add_argument("--newuser")
-    p.add_argument("--role-id", default="usermanagementrole")
+    p.add_argument("--role-id", default="user_mgmt_role")
     p.add_argument("--role-name", default="User Management Role")
     a = p.parse_args()
 
+    # load resource files
     hmap = load_json(HSM_FILE)
     vmap = load_json(VERSION_MAP_FILE)
-    rsrc = load_json(ROLE_RESOURCE_FILE)
+    resources = load_json(CUSTOM_ROLE_FILE)
 
     entry = next((h for h in hmap["hsms"] if h["id"] == a.hsm_id), None)
     if not entry:
-        raise SystemExit("[ERROR] HSM not in mapping file.")
+        raise SystemExit("[ERROR] HSM id not found")
 
     host = entry.get("ipAddress") or entry.get("host")
     port = int(entry.get("port", 8443))
     base = f"https://{host}:{port}"
 
     ENV_MAP = {
-        "DEV": "svc_at48994_usrmgt",
-        "TE1": "svc_at48993_usrmgt",
-        "TE2": "svc_at48992_usrmgt",
+        "DEV":  "svc_at48994_usrmgt",
+        "TE1":  "svc_at48993_usrmgt",
+        "TE2":  "svc_at48992_usrmgt",
         "PROD": "svc_at49008_usrmgt"
     }
+
     new_user = a.newuser or ENV_MAP[a.env]
 
     admin_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
@@ -176,23 +175,24 @@ def main():
     sess.verify = False
     sess.headers.clear()
 
-    rest_login(sess, base, a.apiuser, admin_pw, None)
+    print(f"[INFO] connecting to {host}:{port} ...")
+    rest_login(sess, base, a.apiuser, admin_pw)
 
-    fw_full = detect_fw(sess, base)
-    fw = extract_xyz(fw_full)
-    ctver = pick_ct_version(fw, vmap)
-    if not ctver:
-        raise SystemExit(f"[ERROR] No CT mapping for firmware {fw}")
+    fw = detect_fw(sess, base)
+    ct = pick_ct(fw, vmap)
+    sess.headers.update({"Content-Type": ct})
 
-    sess.headers.update({"Content-Type": f"application/vnd.safenetinc.lunasa+json;version={ctver}"})
+    print(f"[INFO] CT: {ct}")
+    print(f"[INFO] resources loaded: {len(resources)}")
 
-    create_role(sess, base, a.role_id, a.role_name)
-    upload_resources(sess, base, a.role_id, rsrc["commands"], ctver)
-    create_user(sess, base, new_user, new_user_pw, a.role_id)
-    assign_role(sess, base, a.role_id, new_user)
-    save_pw(new_user, new_user_pw)
+    create_role(sess, base, a.role_id, a.role_name, resources)
+
+    ok = create_user(sess, base, new_user, new_user_pw, a.role_id)
+    if ok:
+        save_pw(new_user, new_user_pw)
 
     print("\n[COMPLETE]\n")
+
 
 if __name__ == "__main__":
     main()

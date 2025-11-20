@@ -1,21 +1,209 @@
-import json, os, io
+#!/usr/bin/env python3
+"""
+Luna HSM User Management (REST) — LunaShell-style
+ - Mirrors LunaShell behaviour: same env mapping, same file handling style.
+ - Role resources are plain text lines (one resource per line), not JSON.
+ - Auto-installs 'requests' if missing (same pattern LunaShell used).
+"""
 
-paths = [
-    "resources/hsm_mapping.json",
-    "resources/version_map.json",
-    "resources/custom_role_resources.json"
-]
+# ----------------------------
+# auto-install requests like LunaShell did for paramiko
+# ----------------------------
+try:
+    import requests
+except ImportError:
+    import subprocess, sys
+    print("[INFO] Installing missing dependency: requests ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
 
-for p in paths:
-    print("\n=== Checking:", p, "===")
-    print("Exists:", os.path.exists(p))
-    if not os.path.exists(p):
-        continue
+# silence urllib3 cert warnings (we use self-signed in lab)
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+# standard libs
+import os
+import json
+import sys
+import getpass
+
+# ----------------------------
+# paths & constants
+# ----------------------------
+RES_DIR = "resources"
+HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+VERSION_FILE = os.path.join(RES_DIR, "version_map.json")
+# default role resources file — plain text (one resource per line)
+ROLE_FILE_TXT = os.path.join(RES_DIR, "custom_role_resources.txt")
+ROLE_FILE_JSON = os.path.join(RES_DIR, "custom_role_resources.json")
+
+os.makedirs(RES_DIR, exist_ok=True)
+
+CUSTOM_ROLE_NAME = "user_mgmt_role"
+
+# env -> luna user mapping (same as LunaShell)
+ENV_USER_MAP = {
+    "DEV": "svc_at48994_usrmgt",
+    "TE1": "svc_at48993_usrmgt",
+    "TE2": "svc_at48992_usrmgt",
+    "PROD": "svc_at49008_usrmgt"
+}
+
+# ----------------------------
+# small helpers
+# ----------------------------
+def load_json(path):
+    if not os.path.exists(path):
+        raise SystemExit(f"[ERROR] Missing: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# load role resource file as plain text lines (LunaShell behaviour)
+def load_role_lines():
+    # prefer .txt, but if .json exists use it as fallback (for safety)
+    if os.path.exists(ROLE_FILE_TXT):
+        path = ROLE_FILE_TXT
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        print(f"[INFO] Loaded role resource lines from: {path} (count={len(lines)})")
+        return lines
+    if os.path.exists(ROLE_FILE_JSON):
+        # fallback: try to read json (but still treat it as list of lines if possible)
+        path = ROLE_FILE_JSON
+        try:
+            data = load_json(path)
+            if isinstance(data, list):
+                lines = [str(x).strip() for x in data if str(x).strip()]
+                print(f"[INFO] Loaded role resources from JSON list: {path} (count={len(lines)})")
+                return lines
+            # if JSON is dict or other, try flattening to lines: join values
+            text = json.dumps(data)
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            print(f"[WARN] JSON role file parsed into lines (fallback).")
+            return lines
+        except Exception as e:
+            raise SystemExit(f"[ERROR] Failed to parse role json: {e}")
+    raise SystemExit(f"[ERROR] Role resources not found. Please create '{ROLE_FILE_TXT}' (preferred).")
+
+# login helper
+def luna_login(host, admin_user, admin_pass, rest_ver):
+    url = f"https://{host}:8443/auth/session"
+    headers = {"Content-Type": f"application/vnd.safenetinc.lunasa+json;version={rest_ver}"}
+    # Luna returns 204 on successful basic auth session creation (observed)
     try:
-        raw = io.open(p, "r", encoding="utf-8-sig").read()
-        print("First 200 chars:", repr(raw[:200]))
-        obj = json.loads(raw)
-        print("JSON OK — type:", type(obj).__name__)
+        r = requests.post(url, headers=headers, auth=(admin_user, admin_pass), verify=False)
     except Exception as e:
-        print("JSON ERROR:", e)
+        raise SystemExit(f"[ERROR] Login request failed: {e}")
+    if r.status_code not in (200, 204):
+        raise SystemExit(f"[ERROR] Login failed ({r.status_code}): {r.text}")
+    print("[INFO] Login successful.")
+    return r.cookies  # session cookie jar
+
+# small wrapper for requests that prints failures
+def do_req(method, url, headers=None, cookies=None, json_data=None, data=None):
+    try:
+        r = requests.request(method, url, headers=headers, cookies=cookies, json=json_data, data=data, verify=False)
+    except Exception as e:
+        print(f"[ERROR] Request to {url} failed: {e}")
+        return None
+    return r
+
+# ----------------------------
+# main
+# ----------------------------
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Luna REST user mgmt — LunaShell style")
+    p.add_argument("--hsm-id", required=True, help="HSM id from mapping file")
+    p.add_argument("--env", required=True, help="Environment (DEV|TE1|TE2|PROD)")
+    p.add_argument("--adminuser", default="admin")
+    p.add_argument("--adminpass", help="Admin password (optional; will prompt if omitted)")
+    p.add_argument("--newuser", help="Optional override for the new username")
+    args = p.parse_args()
+
+    # load required files
+    print("=== Checking: files ===")
+    if not os.path.exists(HSM_FILE):
+        raise SystemExit(f"[ERROR] Missing mapping: {HSM_FILE}")
+    if not os.path.exists(VERSION_FILE):
+        raise SystemExit(f"[ERROR] Missing mapping: {VERSION_FILE}")
+    print(f"[INFO] Found mapping files.")
+
+    hsm_map = load_json(HSM_FILE)
+    ver_map = load_json(VERSION_FILE)
+    role_lines = load_role_lines()  # plain-text lines
+
+    # find hsm
+    hsm_entry = None
+    for h in hsm_map.get("hsms", []):
+        if h.get("id") == args.hsm_id:
+            hsm_entry = h
+            break
+    if not hsm_entry:
+        raise SystemExit(f"[ERROR] HSM id '{args.hsm_id}' not found.")
+
+    host = hsm_entry.get("ipAddress") or hsm_entry.get("host")
+    fw = hsm_entry.get("fwVersion")
+    rest_ver = ver_map.get(fw)
+    if not rest_ver:
+        raise SystemExit(f"[ERROR] Firmware '{fw}' not mapped to REST API version.")
+
+    print(f"[INFO] HSM: {host} fw:{fw} -> rest-version:{rest_ver}")
+
+    env = args.env.upper()
+    if args.newuser:
+        new_user = args.newuser
+    else:
+        new_user = ENV_USER_MAP.get(env)
+        if not new_user:
+            raise SystemExit(f"[ERROR] Unsupported env '{env}'")
+
+    admin_user = args.adminuser
+    admin_pass = args.adminpass or getpass.getpass(f"Password for {admin_user}: ")
+
+    # login
+    session_cookie = luna_login(host, admin_user, admin_pass, rest_ver)
+
+    # create role (id + fullname)
+    create_role_url = f"https://{host}:8443/roles"
+    headers = {"Content-Type": f"application/vnd.safenetinc.lunasa+json;version={rest_ver}"}
+    print("[INFO] Creating role entry...")
+    r = do_req("POST", create_role_url, headers=headers, cookies=session_cookie, json_data={"id": CUSTOM_ROLE_NAME, "fullName": CUSTOM_ROLE_NAME})
+    if r is None or r.status_code not in (200, 201, 204):
+        print(f"[ERROR] Role creation failed ({r.status_code if r else 'no-response'}). {r.text if r else ''}")
+        sys.exit(1)
+    print("[INFO] Role created (or already exists).")
+
+    # upload resources as octet-stream (LunaShell equivalent)
+    resources_url = f"https://{host}:8443/roles/{CUSTOM_ROLE_NAME}/resources"
+    payload = "\n".join(role_lines).encode("utf-8")
+    print(f"[INFO] Uploading {len(role_lines)} resource lines to role resources endpoint...")
+    r = do_req("PUT", resources_url, headers={"Content-Type": f"application/vnd.safenetinc.lunasa+octet-stream;version={rest_ver}"}, cookies=session_cookie, data=payload)
+    if r is None or r.status_code not in (200, 204):
+        print(f"[ERROR] Upload role resources failed ({r.status_code if r else 'no-response'}). {r.text if r else ''}")
+        sys.exit(1)
+    print("[INFO] Role resources uploaded.")
+
+    # create user
+    create_user_url = f"https://{host}:8443/api/lunasa/users"
+    print(f"[INFO] Creating user '{new_user}' ...")
+    r = do_req("POST", create_user_url, headers=headers, cookies=session_cookie, json_data={"username": new_user})
+    if r is None or r.status_code not in (200, 201, 204):
+        print(f"[ERROR] User creation failed ({r.status_code if r else 'no-response'}). {r.text if r else ''}")
+        sys.exit(1)
+    print("[INFO] User created.")
+
+    # assign role to user
+    assign_url = f"https://{host}:8443/api/lunasa/users/{new_user}/roles"
+    print(f"[INFO] Assigning role '{CUSTOM_ROLE_NAME}' to user '{new_user}' ...")
+    r = do_req("POST", assign_url, headers=headers, cookies=session_cookie, json_data={"role": CUSTOM_ROLE_NAME})
+    if r is None or r.status_code not in (200, 204):
+        print(f"[ERROR] Role assignment failed ({r.status_code if r else 'no-response'}). {r.text if r else ''}")
+        sys.exit(1)
+    print("[INFO] Role assigned successfully.")
+
+    print("\n[SUCCESS] Done.\n")
+
+
+if __name__ == "__main__":
+    main()

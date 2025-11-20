@@ -1,32 +1,21 @@
-python - <<'PY'
-import io, json, sys, os
-p = "resources/custom_role_resources.json"
-print("path:", p, "exists:", os.path.exists(p))
-if not os.path.exists(p):
-    sys.exit(0)
-s = io.open(p, "r", encoding="utf-8-sig").read()   # utf-8-sig strips BOM when reading
-print("---- first 400 chars ----")
-print(s[:400])
-print("---- repr (shows hidden chars) ----")
-print(repr(s[:200]))
-print("---- trying json.loads() ----")
-try:
-    obj = json.loads(s)
-    print("JSON parsed OK; type:", type(obj).__name__)
-    # show small preview
-    if isinstance(obj, dict):
-        print("keys:", list(obj.keys())[:20])
-    elif isinstance(obj, list):
-        print("first items (up to 5):", obj[:5])
-    else:
-        print("value:", obj)
-except json.JSONDecodeError as e:
-    print("JSONDecodeError:", e)
-    # show context
-    ln = e.lineno
-    col = e.colno
-    print("error at line",ln,"col",col)
-    lines = s.splitlines()
-    for i in range(max(0,ln-3), min(len(lines), ln+2)):
-        print(f"{i+1:4d}: {lines[i]}")
-PY
+import json, os, io
+
+paths = [
+    "resources/hsm_mapping.json",
+    "resources/version_map.json",
+    "resources/custom_role_resources.json"
+]
+
+for p in paths:
+    print("\n=== Checking:", p, "===")
+    print("Exists:", os.path.exists(p))
+    if not os.path.exists(p):
+        continue
+
+    try:
+        raw = io.open(p, "r", encoding="utf-8-sig").read()
+        print("First 200 chars:", repr(raw[:200]))
+        obj = json.loads(raw)
+        print("JSON OK — type:", type(obj).__name__)
+    except Exception as e:
+        print("JSON ERROR:", e)

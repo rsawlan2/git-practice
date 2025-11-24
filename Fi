@@ -1,146 +1,122 @@
 #!/usr/bin/env python3
 
-# ================= DEPENDENCIES (Lunashell style) =================
-try:
-    import os
-    import json
-    import argparse
-    import subprocess
-    import getpass
-except ImportError:
-    print("[INFO] Installing missing dependencies...")
-    subprocess.check_call(["python", "-m", "pip", "install", "requests"])
+import os
+import sys
+import json
+import subprocess
+import shutil
 
-# ================= CONFIG =================
-RES_DIR = "resources"
+# ================= DEPENDENCY CHECK =================
+
+def check_dependency(cmd):
+    if shutil.which(cmd) is None:
+        print(f"[ERROR] Required dependency '{cmd}' not found.")
+        sys.exit(1)
+
+check_dependency("curl")
+
+# ================= PATHS =================
+
+BASE_DIR = os.getcwd()
+RES_DIR = os.path.join(BASE_DIR, "resources")
+COOKIE_FILE = os.path.join(BASE_DIR, "cookie.txt")
+ROLE_RESOURCE_FILE = os.path.join(RES_DIR, "usermg_role_resources")
+
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
 VERSION_MAP_FILE = os.path.join(RES_DIR, "version_map.json")
-ROLE_RES_FILE = os.path.join(RES_DIR, "usermg_role_resources")
 
-FIXED_ROLE_NAME = "usermanagementrole"
+FIXED_ROLE = "usermanagementrole"
 
-ENV_USER_MAP = {
-    "DEV": "svc_at48994_usrmgt",
-    "TE1": "svc_at48993_usrmgt",
-    "TE2": "svc_at48992_usrmgt",
-    "PROD": "svc_at49008_usrmgt"
-}
-
-# ================= HELPERS =================
+# ================= UTIL =================
 
 def load_hsm(hsm_id):
     with open(HSM_FILE) as f:
         data = json.load(f)
+
     for h in data["hsms"]:
         if h["id"] == hsm_id:
             return h
-    raise SystemExit(f"[ERROR] HSM {hsm_id} not found")
+    print("[ERROR] Invalid HSM ID")
+    sys.exit(1)
 
-def resolve_version(fw):
+
+def map_version(fw):
     with open(VERSION_MAP_FILE) as f:
-        vmap = json.load(f)
-    version = vmap.get(fw)
-    if not version:
-        raise SystemExit(f"[ERROR] No API version mapping for firmware {fw}")
-    print(f"[INFO] Firmware {fw} mapped to API version {version}")
-    return version
+        version_map = json.load(f)
+
+    api_version = version_map.get(fw, "10")
+    print(f"[INFO] Firmware {fw} mapped to API version {api_version}")
+    return api_version
+
 
 def run(cmd):
-    print("[DEBUG] Executing:", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    print(result.stdout)
+    print("[DEBUG]", cmd)
+    result = subprocess.run(cmd, shell=True)
     if result.returncode != 0:
-        print(result.stderr)
-        raise SystemExit("[ERROR] Command failed")
-    return result.stdout
+        print("[ERROR] Command failed")
+        sys.exit(1)
 
-# ================= MAIN FLOW =================
+
+# ================= CURL FLOW (MIRRORED) =================
+
+def create_session(ip, apiuser, apipass):
+    cmd = (
+        f'curl -k -c "{COOKIE_FILE}" '
+        f'-u {apiuser}:{apipass} '
+        f'https://{ip}:8443/auth/session'
+    )
+    run(cmd)
+
+
+def create_role(ip, version):
+    cmd = (
+        f'curl -k -b "{COOKIE_FILE}" -X POST '
+        f'-H "Content-Type: application/vnd.safenetinc.lunasa+json;version={version}" '
+        f'-d \'{{"roleId":"{FIXED_ROLE}","fullName":"{FIXED_ROLE}"}}\' '
+        f'https://{ip}:8443/roles'
+    )
+    run(cmd)
+
+
+def upload_role_resources(ip, version):
+    if not os.path.exists(ROLE_RESOURCE_FILE):
+        print("[ERROR] Role resource file missing:", ROLE_RESOURCE_FILE)
+        sys.exit(1)
+
+    cmd = (
+        f'curl -k -b "{COOKIE_FILE}" -X PUT '
+        f'-H "Content-Type: application/vnd.safenetinc.lunasa+octet-stream;version={version}" '
+        f'--data-binary "@{ROLE_RESOURCE_FILE}" '
+        f'https://{ip}:8443/roles/{FIXED_ROLE}/resources'
+    )
+    run(cmd)
+
+
+# ================= MAIN =================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hsm-id", required=True)
-    parser.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"])
-    parser.add_argument("--apiuser", required=True)
-    parser.add_argument("--apipass")
+    if len(sys.argv) < 4:
+        print("Usage:")
+        print("python um_rest_api.py <hsm_id> <apiuser> <apipass>")
+        sys.exit(1)
 
-    args = parser.parse_args()
+    hsm_id = sys.argv[1]
+    apiuser = sys.argv[2]
+    apipass = sys.argv[3]
 
-    hsm = load_hsm(args.hsm_id)
-    base_ip = hsm["ipAddress"]
-    firmware = hsm["fwVersion"]
+    hsm = load_hsm(hsm_id)
+    ip = hsm["ipAddress"]
+    fw = hsm["fwVersion"]
 
-    api_version = resolve_version(firmware)
-    base_url = f"https://{base_ip}:8443"
+    version = map_version(fw)
 
-    new_user = ENV_USER_MAP[args.env]
-    api_password = args.apipass or getpass.getpass("API Password: ")
+    print("[INFO] Starting Luna flow via CURL inside Python...")
 
-    print(f"[INFO] HSM ID: {args.hsm_id}")
-    print(f"[INFO] Environment: {args.env}")
-    print(f"[INFO] New user: {new_user}")
+    create_session(ip, apiuser, apipass)
+    create_role(ip, version)
+    upload_role_resources(ip, version)
 
-    # ================= LOGIN (Session Cookie) =================
-    print("[INFO] Establishing session...")
-
-    session_out = run([
-        "curl","-k","-i",
-        "-u", f"{args.apiuser}:{api_password}",
-        "-H", f"Content-Type: application/vnd.safenetinc.lunasa+json;version={api_version}",
-        f"{base_url}/auth/session"
-    ])
-
-    # Extract SESSION_ID
-    session_id = None
-    for line in session_out.splitlines():
-        if "SESSION_ID" in line:
-            session_id = line.split("SESSION_ID=")[1].split(";")[0]
-
-    if not session_id:
-        raise SystemExit("[ERROR] Could not obtain SESSION_ID")
-
-    print(f"[INFO] Session ID: {session_id}")
-
-    # ================= CREATE ROLE =================
-    run([
-        "curl","-k","-X","POST",
-        "-H", f"Content-Type: application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "-H", f"Cookie: SESSION_ID={session_id}",
-        "-d", f'{{"roleId":"{FIXED_ROLE_NAME}","fullName":"{FIXED_ROLE_NAME}"}}',
-        f"{base_url}/roles"
-    ])
-
-    # ================= UPLOAD ROLE RESOURCES =================
-    resource_path = os.path.abspath(ROLE_RES_FILE)
-
-    print("[INFO] Resource file:", resource_path)
-
-    run([
-        "curl","-k","-X","PUT",
-        "-H", f"Content-Type: application/vnd.safenetinc.lunasa+octet-stream;version={api_version}",
-        "-H", f"Cookie: SESSION_ID={session_id}",
-        "--data-binary", f"@{resource_path}",
-        f"{base_url}/roles/{FIXED_ROLE_NAME}/resources"
-    ])
-
-    # ================= CREATE USER =================
-    run([
-        "curl","-k","-X","POST",
-        "-H", f"Content-Type: application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "-H", f"Cookie: SESSION_ID={session_id}",
-        "-d", f'{{"userId":"{new_user}","password":"TempPass@123"}}',
-        f"{base_url}/api/lunasa/users"
-    ])
-
-    # ================= ASSIGN ROLE =================
-    run([
-        "curl","-k","-X","POST",
-        "-H", f"Content-Type: application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "-H", f"Cookie: SESSION_ID={session_id}",
-        "-d", f'{{"roleId":"{FIXED_ROLE_NAME}"}}',
-        f"{base_url}/api/lunasa/users/{new_user}/roles"
-    ])
-
-    print("[SUCCESS] Flow completed exactly like LunaShell ✅")
+    print("[SUCCESS] Flow completed exactly like working curl")
 
 
 if __name__ == "__main__":

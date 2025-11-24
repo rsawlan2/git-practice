@@ -12,60 +12,63 @@ APIPASSWORD = sys.argv[2]
 LOGIN_URL = f"{BASE_URL}/auth/session"
 ROLES_URL = f"{BASE_URL}/roles"
 
-def build_auth_header(user, password):
-    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+
+def basic_auth(user, pwd):
+    token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
     return f"Basic {token}"
 
 
 def get_session_cookie():
-    print("1️⃣ LOGIN (exact curl behaviour)")
+    print("🔐 LOGIN (curl-style exact replication)")
 
     headers = {
         "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",
-        "Authorization": build_auth_header(APIUSER, APIPASSWORD)
+        "Authorization": basic_auth(APIUSER, APIPASSWORD),
+        "Content-Length": "0"
     }
 
     r = requests.post(
         LOGIN_URL,
         headers=headers,
-        verify=False,
-        allow_redirects=False
+        data="",              # MUST be empty string
+        verify=False
     )
 
     print("Status:", r.status_code)
-    print("Response headers:", r.headers)
 
     if r.status_code != 204:
+        print("Headers:", r.headers)
+        print("Body:", r.text)
         raise Exception(f"Login failed: {r.status_code}")
 
-    cookie_header = r.headers.get("Set-Cookie")
-    if not cookie_header or "SESSION_ID" not in cookie_header:
-        raise Exception("SESSION_ID not found in Set-Cookie header")
+    cookie = r.headers.get("Set-Cookie")
+    if not cookie or "SESSION_ID" not in cookie:
+        raise Exception("SESSION_ID not returned by server")
 
-    session_id = cookie_header.split("SESSION_ID=")[1].split(";")[0]
+    session_id = cookie.split("SESSION_ID=")[1].split(";")[0]
     print("✅ SESSION_ID:", session_id)
     return session_id
 
 
 def create_role(session_id):
-    print("2️⃣ CREATE ROLE")
-
-    payload = {
-        "roleId": ROLE_NAME,
-        "fullName": ROLE_NAME
-    }
+    print("📦 Creating role")
 
     headers = {
         "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",
         "Cookie": f"SESSION_ID={session_id}"
     }
 
+    payload = {
+        "roleId": ROLE_NAME,
+        "fullName": ROLE_NAME
+    }
+
     r = requests.post(ROLES_URL, headers=headers, json=payload, verify=False)
-    print("Status:", r.status_code)
+    print("Create Role Status:", r.status_code)
 
 
 def upload_resources(session_id):
-    print("3️⃣ UPLOAD RESOURCES")
+    print("📤 Uploading resources")
 
     headers = {
         "Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10",
@@ -80,11 +83,11 @@ def upload_resources(session_id):
             verify=False
         )
 
-    print("Status:", r.status_code)
+    print("Upload Status:", r.status_code)
 
 
 def verify_role(session_id):
-    print("4️⃣ VERIFY ROLE")
+    print("🔎 Verifying role")
 
     headers = {
         "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",

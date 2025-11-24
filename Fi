@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-# ========== Dependencies ==========
 try:
     import requests
     import urllib3
@@ -19,11 +18,11 @@ import datetime
 import secrets
 import string
 import getpass
-import re
 
-# ========== Constants ==========
+# ================= CONFIG =================
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
+VERSION_MAP_FILE = os.path.join(RES_DIR, "version_map.json")
 PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 ROLE_RES_FILE = os.path.join(RES_DIR, "usermg_role_resources")
 
@@ -39,11 +38,8 @@ ENV_USER_MAP = {
 os.makedirs(RES_DIR, exist_ok=True)
 
 
-# ========== Utility Functions ==========
+# ================= UTILS =================
 def load_hsm(hsm_id):
-    if not os.path.exists(HSM_FILE):
-        raise SystemExit(f"[ERROR] missing {HSM_FILE}")
-
     with open(HSM_FILE, "r") as f:
         data = json.load(f)
 
@@ -54,6 +50,32 @@ def load_hsm(hsm_id):
     raise SystemExit(f"[ERROR] HSM {hsm_id} not found")
 
 
+def map_version_from_fw(hsm_data):
+    fw = hsm_data.get("fwVersion")
+
+    if not fw:
+        print("[WARN] fwVersion missing, defaulting to 10")
+        return "10"
+
+    with open(VERSION_MAP_FILE, "r") as f:
+        version_map = json.load(f)
+
+    api_version = version_map.get(fw)
+
+    if not api_version:
+        print(f"[WARN] No mapping for fw {fw}, defaulting to 10")
+        return "10"
+
+    print(f"[INFO] Firmware {fw} mapped to API version {api_version}")
+    return api_version
+
+
+def luna_headers(version, octet=False):
+    if octet:
+        return {"Content-Type": f"application/vnd.safenetinc.lunasa+octet-stream;version={version}"}
+    return {"Content-Type": f"application/vnd.safenetinc.lunasa+json;version={version}"}
+
+
 def generate_password(length=16):
     chars = string.ascii_letters + string.digits + "._-"
     return ''.join(secrets.choice(chars) for _ in range(length))
@@ -62,11 +84,8 @@ def generate_password(length=16):
 def save_password(username, password):
     data = {}
     if os.path.exists(PW_STORE):
-        try:
-            with open(PW_STORE, "r") as f:
-                data = json.load(f)
-        except:
-            data = {}
+        with open(PW_STORE, "r") as f:
+            data = json.load(f)
 
     data[username] = {
         "password": password,
@@ -77,20 +96,7 @@ def save_password(username, password):
         json.dump(data, f, indent=2)
 
 
-def detect_version(base_url, session):
-    r = session.get(base_url + "/", verify=False)
-    ct = r.headers.get("Content-Type", "")
-    match = re.search(r"version=(\d+)", ct)
-    return match.group(1) if match else "10"
-
-
-def luna_headers(version, octet=False):
-    if octet:
-        return {"Content-Type": f"application/vnd.safenetinc.lunasa+octet-stream;version={version}"}
-    return {"Content-Type": f"application/vnd.safenetinc.lunasa+json;version={version}"}
-
-
-# ========== Core Luna Functions ==========
+# ================= LUNA ACTIONS =================
 def create_session(base_url, session, user, password, version):
     r = session.post(
         base_url + "/auth/session",
@@ -102,23 +108,11 @@ def create_session(base_url, session, user, password, version):
 
 
 def create_role(base_url, session, version):
-    payload = {
-        "roleId": FIXED_ROLE_NAME,
-        "fullName": FIXED_ROLE_NAME
-    }
-
-    session.post(
-        base_url + "/roles",
-        headers=luna_headers(version),
-        json=payload,
-        verify=False
-    )
+    payload = {"roleId": FIXED_ROLE_NAME, "fullName": FIXED_ROLE_NAME}
+    session.post(base_url + "/roles", headers=luna_headers(version), json=payload, verify=False)
 
 
 def upload_role_resources(base_url, session, version):
-    if not os.path.exists(ROLE_RES_FILE):
-        raise SystemExit(f"[ERROR] Missing role resource file: {ROLE_RES_FILE}")
-
     with open(ROLE_RES_FILE, "rb") as f:
         raw = f.read()
 
@@ -131,12 +125,8 @@ def upload_role_resources(base_url, session, version):
 
 
 def create_user(base_url, session, version, username):
-    password = generate_password()
-
-    payload = {
-        "userId": username,
-        "password": password
-    }
+    pw = generate_password()
+    payload = {"userId": username, "password": pw}
 
     r = session.post(
         base_url + "/api/lunasa/users",
@@ -148,13 +138,12 @@ def create_user(base_url, session, version, username):
     if r.status_code not in (200, 201, 204):
         raise SystemExit("[ERROR] User creation failed")
 
-    save_password(username, password)
-    return password
+    save_password(username, pw)
+    return pw
 
 
-def assign_role_to_user(base_url, session, version, username):
+def assign_role(base_url, session, version, username):
     payload = {"roleId": FIXED_ROLE_NAME}
-
     session.post(
         f"{base_url}/api/lunasa/users/{username}/roles",
         headers=luna_headers(version),
@@ -163,47 +152,44 @@ def assign_role_to_user(base_url, session, version, username):
     )
 
 
-# ========== Main Flow ==========
+# ================= MAIN =================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hsm-id", required=True)
-    parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"], type=str.upper)
-    parser.add_argument("--sshuser", default="admin")
-    parser.add_argument("--sshpassword")
+    parser.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"], type=str.upper)
+    parser.add_argument("--apiuser", required=True)
+    parser.add_argument("--apipass")
     parser.add_argument("--newuser")
+
     args = parser.parse_args()
 
     hsm = load_hsm(args.hsm_id)
-    host = hsm.get("ipAddress") or hsm.get("host")
+    host = hsm.get("ipAddress")
     base_url = f"https://{host}:8443"
 
-    username = args.newuser or ENV_USER_MAP.get(args.env)
-    if not username:
+    target_user = args.newuser or ENV_USER_MAP.get(args.env)
+    if not target_user:
         raise SystemExit("[ERROR] Invalid environment mapping")
 
-    admin_user = args.sshuser
-    admin_pw = args.sshpassword or getpass.getpass(f"Password for {admin_user}@HSM: ")
+    api_password = args.apipass or getpass.getpass(f"Password for {args.apiuser}@HSM: ")
 
     print(f"[INFO] Target HSM: {args.hsm_id}")
     print(f"[INFO] Environment: {args.env}")
-    print(f"[INFO] User to create: {username}")
+    print(f"[INFO] User to create: {target_user}")
+
+    version = map_version_from_fw(hsm)
 
     session = requests.Session()
 
-    version = detect_version(base_url, session)
-    print(f"[INFO] Detected Luna version: {version}")
-
-    if not create_session(base_url, session, admin_user, admin_pw, version):
+    if not create_session(base_url, session, args.apiuser, api_password, version):
         raise SystemExit("[ERROR] Failed to establish Luna session")
 
     create_role(base_url, session, version)
     upload_role_resources(base_url, session, version)
+    create_user(base_url, session, version, target_user)
+    assign_role(base_url, session, version, target_user)
 
-    pw = create_user(base_url, session, version, username)
-    assign_role_to_user(base_url, session, version, username)
-
-    print(f"[SUCCESS] User '{username}' created and role assigned.")
-    print("[SUCCESS] Operation completed cleanly.")
+    print("[SUCCESS] User created and role assigned successfully.")
 
 
 if __name__ == "__main__":

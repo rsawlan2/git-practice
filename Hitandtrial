@@ -1,330 +1,153 @@
-#!/usr/bin/env python3
-"""
-user_mgmt.py
+import requests
+import json
+import urllib3
+import os
+import argparse
+import datetime
+import secrets
+import string
 
-Automates creation of a user-management role and user on Luna HSMs.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-Features:
-  --dry-run     : Show planned actions, no changes applied
-  --test-ssh    : Test SSH login (user list) and exit
-  --skip-webserver : Skip webserver checks, attempt LunaSH ops directly
-"""
+BASE_URL = "https://10.24.128.64:8443"
+ADMIN_USER = "admin"
+ADMIN_PASSWORD = "q......"  # admin password
 
-# ----------------------------
-# Dependency bootstrap
-# ----------------------------
-try:
-    import asyncssh, portalocker
-except ImportError:
-    import subprocess, sys
-    print("[INFO] Installing required dependencies (asyncssh, portalocker)...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "asyncssh", "portalocker"])
-    import asyncssh, portalocker
+ROLE_ID = "usermanagementrole"
+RESOURCE_FILE = "resources/usermanagement.txt"
+PW_STORE = "resources/user_passwords.json"
 
-import os, json, asyncio, secrets, string, random, getpass
+os.makedirs("resources", exist_ok=True)
 
-# ----------------------------
-# Config
-# ----------------------------
-RES_DIR = "resources"
-HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
-VERSION_FILE = os.path.join(RES_DIR, "version_map.json")
-ROLES_DIR = os.path.join(RES_DIR, "roles")
-FAILED_LOG = os.path.join(RES_DIR, "failed_jobs.jsonl")
-DEFAULT_ROLE_FILE = "user_mgmt_role.txt"
+# ENV → USER mapping (same as lunashell)
+ENV_USER_MAP = {
+    "DEV": "svc_at48994_usrmgt",
+    "TE1": "svc_at48993_usrmgt",
+    "TE2": "svc_at48992_usrmgt",
+    "PROD": "svc_at49008_usrmgt"
+}
 
-SSH_RETRIES = 3
-BACKOFF_BASE = 0.5
-BACKOFF_FACTOR = 2.0
-BACKOFF_JITTER = 0.2
+def gen_pw(n=16):
+    chars = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(chars) for _ in range(n))
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def save_pw(user, pw):
+    data = {}
+    if os.path.exists(PW_STORE):
+        try:
+            with open(PW_STORE, "r") as f:
+                data = json.load(f)
+        except:
+            data = {}
 
-def check_fw_version(v, cmp_to="7.8.0"):
-    def parse(s): return tuple(int(x) for x in s.split("."))
-    return parse(v) >= parse(cmp_to)
+    data[user] = {
+        "password": pw,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z"
+    }
 
-def gen_username():
-    return "usermgmt_" + secrets.token_hex(3)
+    with open(PW_STORE, "w") as f:
+        json.dump(data, f, indent=2)
 
-def gen_password(length=16):
-    chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
-    while True:
-        p = ''.join(secrets.choice(chars) for _ in range(length))
-        if (any(c.islower() for c in p) and any(c.isupper() for c in p)
-                and any(c.isdigit() for c in p) and any(c in "!@#$%^&*()-_=+" for c in p)):
-            return p
+# ---------------- CLI ----------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"])
+args = parser.parse_args()
 
-async def backoff_sleep(attempt):
-    base = BACKOFF_BASE * (BACKOFF_FACTOR ** (attempt - 1))
-    jitter = random.uniform(-BACKOFF_JITTER, BACKOFF_JITTER)
-    await asyncio.sleep(max(0, base + jitter))
+ENV = args.env
+USER_ID = ENV_USER_MAP.get(ENV)
 
-def write_failed(entry):
-    os.makedirs(os.path.dirname(FAILED_LOG), exist_ok=True)
-    with portalocker.Lock(FAILED_LOG, mode="a", timeout=5) as fh:
-        fh.write(json.dumps(entry) + "\n")
+if not USER_ID:
+    raise SystemExit(f"Invalid ENV: {ENV}")
 
-def get_content_type_token(version_map, fw_version):
-    token = version_map.get(fw_version)
-    if token is None:
-        raise KeyError(f"Firmware version '{fw_version}' not found in {VERSION_FILE}")
-    return token
+USER_PASSWORD = gen_pw()
+save_pw(USER_ID, USER_PASSWORD)
 
-# ----------------------------
-# SSH helpers
-# ----------------------------
-async def connect_password_only(host, port, username, password, timeout=15):
-    return await asyncio.wait_for(
-        asyncssh.connect(
-            host,
-            port=port,
-            username=username,
-            password=password,
-            known_hosts=None,
-            term_type="xterm"
-        ),
-        timeout
+print(f"✅ ENV: {ENV}")
+print(f"✅ User selected: {USER_ID}")
+print("✅ Password auto-generated and stored")
+
+# ---------------- LOGIN ----------------
+HEADERS_JSON = {
+    "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"
+}
+
+login_response = requests.post(
+    f"{BASE_URL}/auth/session",
+    headers=HEADERS_JSON,
+    auth=(ADMIN_USER, ADMIN_PASSWORD),
+    verify=False
+)
+
+session_id = login_response.cookies.get("SESSION_ID")
+if not session_id:
+    raise Exception("Login failed")
+
+SESSION_HEADERS_JSON = {
+    **HEADERS_JSON,
+    "Cookie": f"SESSION_ID={session_id}"
+}
+
+SESSION_HEADERS_STREAM = {
+    "Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10",
+    "Cookie": f"SESSION_ID={session_id}"
+}
+
+print("✅ Logged in successfully")
+
+# ---------------- CREATE ROLE ----------------
+role_payload = {"roleId": ROLE_ID, "fullName": ROLE_ID}
+
+requests.post(
+    f"{BASE_URL}/roles",
+    headers=SESSION_HEADERS_JSON,
+    data=json.dumps(role_payload),
+    verify=False
+)
+
+roles_check = requests.get(
+    f"{BASE_URL}/roles",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
+
+if ROLE_ID not in roles_check.text:
+    raise Exception("❌ Role creation failed")
+
+print(f"✅ Role '{ROLE_ID}' created and verified")
+
+# ---------------- UPLOAD RESOURCES ----------------
+with open(RESOURCE_FILE, "rb") as f:
+    requests.put(
+        f"{BASE_URL}/roles/{ROLE_ID}/resources",
+        headers=SESSION_HEADERS_STREAM,
+        data=f,
+        verify=False
     )
 
-async def run_with_pty(conn, cmd, input_text=None, timeout=30):
-    proc = await conn.create_process(cmd, term_type='xterm')
-    if input_text:
-        proc.stdin.write(input_text)
-    stdout, stderr = [], []
-    async for line in proc.stdout:
-        stdout.append(line)
-    async for line in proc.stderr:
-        stderr.append(line)
-    await proc.wait_closed()
-    return "".join(stdout), "".join(stderr), proc.exit_status
+print(f"✅ Resources uploaded for role '{ROLE_ID}'")
 
-# ----------------------------
-# LunaSH functions
-# ----------------------------
-async def lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
-    host = hsm.get("ipAddress") or hsm.get("host")
-    port = int(hsm.get("port", 22))
-    local_role = os.path.join(ROLES_DIR, role_file)
-    role_name = os.path.splitext(os.path.basename(local_role))[0]
-    remote_role = f"/tmp/{os.path.basename(local_role)}"
+# ---------------- CREATE USER ----------------
+user_payload = {
+    "userId": USER_ID,
+    "role": ROLE_ID,
+    "password": USER_PASSWORD
+}
 
-    conn = await connect_password_only(host, port, ssh_user, ssh_pass)
-    try:
-        async with conn:
-            # upload role file
-            try:
-                async with conn.start_sftp_client() as sftp:
-                    await sftp.put(local_role, remote_role)
-            except Exception as e:
-                raise RuntimeError(f"Role upload failed: {e}")
+requests.post(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    data=json.dumps(user_payload),
+    verify=False
+)
 
-            # commands with LunaSH syntax
-            cmds = [
-                (f"user role import {role_name} {remote_role}", None),
-                (f"user add -userName {user} -password {pwd}", None),
-                (f"user role add {user} {role_name}", None),
-                (f"user password -userName {user}", f"{pwd}\n{pwd}\n"),
-            ]
-            for cmd, inp in cmds:
-                out, err, rc = await run_with_pty(conn, cmd, input_text=inp)
-                if rc != 0:
-                    raise RuntimeError(f"{cmd} failed: {out or err}")
+users_check = requests.get(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
 
-            # verify user creation
-            out, _, _ = await run_with_pty(conn, "user list")
-            return user in out
-    finally:
-        conn.close()
+if USER_ID not in users_check.text:
+    raise Exception("❌ User creation failed")
 
-async def lunash_check_webserver(hsm, ssh_user, ssh_pass):
-    host = hsm.get("ipAddress") or hsm.get("host")
-    port = int(hsm.get("port", 22))
-    try:
-        conn = await connect_password_only(host, port, ssh_user, ssh_pass)
-        async with conn:
-            out, _, _ = await run_with_pty(conn, "webserver show")
-            return "running" in out.lower()
-    except Exception:
-        return False
-
-async def test_ssh_one(hsm, ssh_user, ssh_pass):
-    host = hsm.get("ipAddress") or hsm.get("host")
-    port = int(hsm.get("port", 22))
-    try:
-        conn = await connect_password_only(host, port, ssh_user, ssh_pass)
-        async with conn:
-            out, _, _ = await run_with_pty(conn, "user list")
-            print(f"[{hsm.get('id')} | {host}] user list:\n{out[:200]}")
-            return True, None
-    except Exception as e:
-        return False, str(e)
-
-# ----------------------------
-# REST wrappers
-# ----------------------------
-async def run_cmd(cmd):
-    proc = await asyncio.create_subprocess_exec(*cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
-    return proc.returncode, (out.decode() + err.decode()).strip()
-
-async def curl_auth(base_url, admin_user, admin_pass, ct, insecure):
-    url = f"{base_url}/auth/session"
-    cmd = ["curl", "-s", "-S", "-i", "-X", "POST",
-           "-H", f"Content-Type: {ct}",
-           "-u", f"{admin_user}:{admin_pass}", url]
-    if insecure: cmd.insert(1, "-k")
-    rc, out = await run_cmd(cmd)
-    for line in out.splitlines():
-        if "SESSION_ID=" in line:
-            return line.split("SESSION_ID=")[1].split(";")[0].strip()
-    raise RuntimeError(f"REST login failed: {out}")
-
-async def curl_post_role(base_url, sid, ct, role, insecure):
-    url = f"{base_url}/roles"
-    payload = json.dumps({"roleId": role})
-    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-           "-X", "POST", "-H", f"Content-Type: {ct}",
-           "-H", f"Cookie: SESSION_ID={sid}", url, "-d", payload]
-    if insecure: cmd.insert(1, "-k")
-    _, out = await run_cmd(cmd)
-    return int(out.strip() or -1)
-
-async def curl_put_rolefile(base_url, sid, ct_file, path, role, insecure):
-    url = f"{base_url}/roles/{role}/resources"
-    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-           "-X", "PUT", "-H", f"Content-Type: {ct_file}",
-           "-H", f"Cookie: SESSION_ID={sid}", url, "--data-binary", f"@{path}"]
-    if insecure: cmd.insert(1, "-k")
-    _, out = await run_cmd(cmd)
-    return int(out.strip() or -1)
-
-async def curl_post_user(base_url, sid, ct, user, pwd, role, insecure):
-    url = f"{base_url}/users"
-    payload = json.dumps({"userId": user, "role": role, "password": pwd})
-    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-           "-X", "POST", "-H", f"Content-Type: {ct}",
-           "-H", f"Cookie: SESSION_ID={sid}", url, "-d", payload]
-    if insecure: cmd.insert(1, "-k")
-    _, out = await run_cmd(cmd)
-    return int(out.strip() or -1)
-
-async def curl_get_users(base_url, sid, ct, insecure):
-    url = f"{base_url}/users"
-    cmd = ["curl", "-s", "-i", "-X", "GET",
-           "-H", f"Content-Type: {ct}",
-           "-H", f"Cookie: SESSION_ID={sid}", url]
-    if insecure: cmd.insert(1, "-k")
-    _, out = await run_cmd(cmd)
-    return out
-
-# ----------------------------
-# Orchestration
-# ----------------------------
-async def process_hsm(hsm, admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only=False, skip_webserver=False, ssh_user=None, ssh_pass=None):
-    hid = hsm.get("id")
-    fw = hsm.get("fwVersion")
-    host = hsm.get("ipAddress") or hsm.get("host") or "<no-host>"
-
-    token = get_content_type_token(version_map, fw)
-    ct_json = f"application/vnd.safenetinc.lunasa+json;version={token}"
-    ct_file = f"application/vnd.safenetinc.lunasa+file;version={token}"
-    print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
-
-    ssh_user = ssh_user or admin_user
-    ssh_pass = ssh_pass or admin_pass
-
-    if test_ssh_only:
-        ok, err = await test_ssh_one(hsm, ssh_user, ssh_pass)
-        if not ok:
-            return {"hsm": hid, "status": "SSH-FAILED", "error": err}
-        return {"hsm": hid, "status": "SSH-OK"}
-
-    user, pwd = gen_username(), gen_password()
-    base = hsm.get("rest_url") or f"https://{host}:8443"
-
-    if not skip_webserver and not await lunash_check_webserver(hsm, ssh_user, ssh_pass):
-        return {"hsm": hid, "status": "FAILED", "error": "Webserver not running"}
-
-    if not check_fw_version(fw):
-        if not await lunash_setup(hsm, ssh_user, ssh_pass, role_file, user, pwd):
-            return {"hsm": hid, "status": "FAILED", "error": "LunaSH user setup failed"}
-
-    try:
-        sid = await curl_auth(base, admin_user, admin_pass, ct_json, insecure)
-        rc = await curl_post_role(base, sid, ct_json, os.path.splitext(role_file)[0], insecure)
-        rc = await curl_put_rolefile(base, sid, ct_file, os.path.join(ROLES_DIR, role_file), os.path.splitext(role_file)[0], insecure)
-        rc = await curl_post_user(base, sid, ct_json, user, pwd, os.path.splitext(role_file)[0], insecure)
-        out = await curl_get_users(base, sid, ct_json, insecure)
-        if user not in out:
-            return {"hsm": hid, "status": "WARN", "user": user, "password": pwd}
-    except Exception as e:
-        return {"hsm": hid, "status": "FAILED", "error": str(e)}
-
-    return {"hsm": hid, "status": "OK", "user": user, "password": pwd, "note": "password will be forced to change at first login"}
-
-async def run_all(hsm_ids, admin_user, admin_pass, role_file, insecure, test_ssh_only=False, skip_webserver=False, ssh_user=None, ssh_pass=None):
-    hsms = load_json(HSM_FILE).get("hsms", [])
-    version_map = load_json(VERSION_FILE)
-    lookup = {h["id"]: h for h in hsms}
-    tasks = []
-    for hid in hsm_ids:
-        if hid not in lookup:
-            print(f"[SKIP] {hid} not found")
-            continue
-        tasks.append(process_hsm(lookup[hid], admin_user, admin_pass, role_file, version_map, insecure, test_ssh_only, skip_webserver, ssh_user, ssh_pass))
-    return await asyncio.gather(*tasks)
-
-# ----------------------------
-# Main
-# ----------------------------
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hsm-ids", nargs="+", required=True)
-    parser.add_argument("--admin-user", required=True)
-    parser.add_argument("--role-file", default=DEFAULT_ROLE_FILE)
-    parser.add_argument("--insecure", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--test-ssh", action="store_true")
-    parser.add_argument("--skip-webserver", action="store_true")
-    parser.add_argument("--ssh-user", help="SSH user if different")
-    parser.add_argument("--ssh-pass", help="SSH password if different")
-    args = parser.parse_args()
-
-    admin_pass = getpass.getpass("Admin password: ")
-    ssh_pass = args.ssh_pass or admin_pass
-
-    if args.dry_run:
-        hsms = load_json(HSM_FILE).get("hsms", [])
-        version_map = load_json(VERSION_FILE)
-        for hid in args.hsm_ids:
-            hsm = {h["id"]: h for h in hsms}.get(hid)
-            if not hsm: continue
-            fw = hsm.get("fwVersion")
-            host = hsm.get("ipAddress") or "<no-host>"
-            token = version_map.get(fw, "??")
-            user, pwd = gen_username(), gen_password()
-            print(f"[{hid} | {host}] fw={fw} -> REST v{token}")
-            print(f" Would create user={user} pass={pwd} with role={os.path.splitext(args.role_file)[0]}")
-        return
-
-    results = asyncio.run(run_all(args.hsm_ids, args.admin_user, admin_pass, args.role_file, args.insecure, args.test_ssh, args.skip_webserver, args.ssh_user, ssh_pass))
-    print("\nRESULTS:")
-    for r in results:
-        if r["status"] == "OK":
-            print(f"[{r['hsm']}] OK user={r['user']} pass={r['password']} ({r['note']})")
-        elif r["status"] == "WARN":
-            print(f"[{r['hsm']}] WARN user={r['user']} pass={r['password']} not verified")
-        else:
-            print(f"[{r['hsm']}] FAILED: {r.get('error','unknown')}")
-
-if __name__ == "__main__":
-    main()
+print(f"✅ User '{USER_ID}' created and verified")
+print("🎯 USER MANAGEMENT FLOW COMPLETED SUCCESSFULLY")

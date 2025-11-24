@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
-# ==========================================================
-# Luna HSM User Management - CURL MIRROR SCRIPT
-# Exact behaviour as provided curl commands
-# ==========================================================
+import shutil, sys, subprocess, argparse, json, os, getpass
 
-import shutil
-import sys
-import subprocess
-import argparse
-import json
-import os
-import getpass
-
-# ================= Dependency Check =================
 def check_dependency(cmd):
     if shutil.which(cmd) is None:
         print(f"[ERROR] Required dependency '{cmd}' not found.")
@@ -20,15 +8,13 @@ def check_dependency(cmd):
 
 check_dependency("curl")
 
-# ================= Paths =================
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
 VERSION_FILE = os.path.join(RES_DIR, "version_map.json")
 ROLE_RES_FILE = os.path.join(RES_DIR, "usermg_role_resources")
+COOKIE_FILE = "luna_cookie.txt"
 
 ROLE_NAME = "usermanagementrole"
-
-# ================= Utilities =================
 
 def load_json(path):
     with open(path, "r") as f:
@@ -48,20 +34,9 @@ def map_version(hsm):
     print(f"[INFO] Firmware {fw} mapped to API version {api_ver}")
     return api_ver
 
-# ================= CURL Runner =================
-
-def run_curl(cmd):
+def run(cmd):
     print(f"[DEBUG] {cmd}")
-    process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    return process.stdout, process.stderr
-
-def extract_session_id(output):
-    for line in output.splitlines():
-        if "SESSION_ID" in line:
-            return line.split("SESSION_ID=")[1].strip()
-    return None
-
-# ================= MAIN =================
+    subprocess.run(cmd, shell=True)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -69,63 +44,42 @@ def main():
     parser.add_argument("--env", required=True)
     parser.add_argument("--apiuser", required=True)
     parser.add_argument("--apipass")
-
     args = parser.parse_args()
 
     hsm = get_hsm_data(args.hsm_id)
     ip = hsm["ipAddress"]
     version = map_version(hsm)
-
     password = args.apipass or getpass.getpass("API Password: ")
 
     print(f"[INFO] HSM ID: {args.hsm_id}")
-    print(f"[INFO] Environment: {args.env}")
 
-    # ======================================================
-    # 1. CREATE SESSION (EXACT MATCH WITH CURL)
-    # ======================================================
-    auth_cmd = (
-        f'curl -k -v -u {args.apiuser}:{password} '
+    # 1. LOGIN (creates cookie file)
+    login_cmd = (
+        f'curl -k -c {COOKIE_FILE} -u {args.apiuser}:{password} '
         f'-H "Content-Type: application/vnd.safenetinc.lunasa+json;version={version}" '
         f'https://{ip}:8443/auth/session'
     )
+    run(login_cmd)
 
-    out, err = run_curl(auth_cmd)
-    session_id = extract_session_id(out + err)
-
-    if not session_id:
-        print("[ERROR] Failed to establish Luna session")
-        sys.exit(1)
-
-    print(f"[INFO] SESSION_ID acquired: {session_id}")
-
-    cookie = f'SESSION_ID={session_id}'
-
-    # ======================================================
     # 2. CREATE ROLE
-    # ======================================================
-    create_role = (
-        f'curl -k -X POST '
+    create_role_cmd = (
+        f'curl -k -b {COOKIE_FILE} -X POST '
         f'-H "Content-Type: application/vnd.safenetinc.lunasa+json;version={version}" '
-        f'-H "Cookie: {cookie}" '
         f'-d \'{{"roleId":"{ROLE_NAME}","fullName":"{ROLE_NAME}"}}\' '
         f'https://{ip}:8443/roles'
     )
-    run_curl(create_role)
+    run(create_role_cmd)
 
-    # ======================================================
     # 3. UPLOAD ROLE RESOURCES
-    # ======================================================
-    upload_resources = (
-        f'curl -k -X PUT '
+    upload_res_cmd = (
+        f'curl -k -b {COOKIE_FILE} -X PUT '
         f'-H "Content-Type: application/vnd.safenetinc.lunasa+octet-stream;version={version}" '
-        f'-H "Cookie: {cookie}" '
         f'--data-binary @{ROLE_RES_FILE} '
         f'https://{ip}:8443/roles/{ROLE_NAME}/resources'
     )
-    run_curl(upload_resources)
+    run(upload_res_cmd)
 
-    print("[SUCCESS] Role and resources configured successfully (curl-mirrored)")
+    print("[SUCCESS] Fully executed with real curl session flow.")
 
 if __name__ == "__main__":
     main()

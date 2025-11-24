@@ -16,6 +16,7 @@ import secrets
 import string
 import getpass
 import re
+import base64
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -71,36 +72,44 @@ def save_pw(user, pw):
         pass
 
 
-def detect_api_version(base_url, auth):
-    r = requests.get(f"{base_url}/api/lunasa", auth=auth, verify=False)
+def detect_api_version(base_url):
+    r = requests.get(f"{base_url}/api/lunasa", verify=False)
     text = r.text.lower()
     m = re.search(r"(\d+)", text)
     return m.group(1) if m else "10"
 
 
 def create_session(base_url, username, password, api_version):
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+
     headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}"
+        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}",
+        "Authorization": f"Basic {token}"
     }
 
     r = requests.post(
         f"{base_url}/auth/session",
         headers=headers,
-        auth=(username, password),
         verify=False
     )
 
     if r.status_code not in (200, 204):
         raise SystemExit(f"[ERROR] failed to establish session (status {r.status_code})")
 
-    return r.cookies.get("SESSION_ID"), headers
+    return r.cookies.get("SESSION_ID")
 
 
-def ensure_role_exists(base_url, session_id, headers):
+def ensure_role_exists(base_url, session_id, api_version):
+    headers = {
+        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}",
+        "Cookie": f"SESSION_ID={session_id}"
+    }
+
     payload = {"roleId": FIXED_ROLE_NAME, "fullName": FIXED_ROLE_NAME}
+
     requests.post(
         f"{base_url}/roles",
-        headers={**headers, "Cookie": f"SESSION_ID={session_id}"},
+        headers=headers,
         json=payload,
         verify=False
     )
@@ -148,7 +157,6 @@ def create_user(base_url, session_id, api_version, username, password):
         raise SystemExit(f"[ERROR] user creation failed for '{username}'")
 
     save_pw(username, password)
-    print(f"[INFO] user '{username}' created")
 
 
 def assign_role(base_url, session_id, api_version, username):
@@ -168,8 +176,6 @@ def assign_role(base_url, session_id, api_version, username):
 
     if r.status_code not in (200, 201, 204):
         raise SystemExit(f"[ERROR] couldn't assign role to '{username}'")
-
-    print(f"[INFO] role assigned to '{username}'")
 
 
 def main():
@@ -196,12 +202,10 @@ def main():
     host = h.get("ipAddress") or h.get("host")
     base_url = f"https://{host}:8443"
 
-    auth = (args.apiuser, api_pw)
-    api_version = detect_api_version(base_url, auth)
+    api_version = detect_api_version(base_url)
+    session_id = create_session(base_url, args.apiuser, api_pw, api_version)
 
-    session_id, headers = create_session(base_url, args.apiuser, api_pw, api_version)
-
-    ensure_role_exists(base_url, session_id, headers)
+    ensure_role_exists(base_url, session_id, api_version)
     upload_role_resources(base_url, session_id, api_version)
 
     user_pw = gen_pw()

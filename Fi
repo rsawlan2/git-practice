@@ -1,107 +1,75 @@
-import requests
+import subprocess
+import re
 import sys
-import base64
 
-BASE_URL = "https://10.24.128.64:8443"
-ROLE_NAME = "customusermanagement"
+CURL = r"C:\Users\t718999\UBS\My Program Files\portablegit\mingw64\bin\curl.exe"
+BASE = "https://10.24.128.64:8443"
+ROLE = "customusermanagement"
 RESOURCE_FILE = "customusermanagement.txt"
 
-APIUSER = sys.argv[1]
-APIPASSWORD = sys.argv[2]
-
-LOGIN_URL = f"{BASE_URL}/auth/session"
-ROLES_URL = f"{BASE_URL}/roles"
+USER = sys.argv[1]
+PASSWORD = sys.argv[2]
 
 
-def basic_auth(user, pwd):
-    token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
-    return f"Basic {token}"
+def run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout + result.stderr
 
 
-def get_session_cookie():
-    print("🔐 LOGIN (curl-style exact replication)")
+print("🔐 LOGIN via real curl")
+login_cmd = [
+    CURL, "-vk", "-X", "POST",
+    "-H", "Content-Type: application/vnd.safenetinc.lunasa+json;version=10",
+    "-u", f"{USER}:{PASSWORD}",
+    f"{BASE}/auth/session"
+]
 
-    headers = {
-        "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",
-        "Authorization": basic_auth(APIUSER, APIPASSWORD),
-        "Content-Length": "0"
-    }
+output = run(login_cmd)
 
-    r = requests.post(
-        LOGIN_URL,
-        headers=headers,
-        data="",              # MUST be empty string
-        verify=False
-    )
+# Extract SESSION_ID from curl output
+match = re.search(r"Set-Cookie: SESSION_ID=([^;]+)", output)
+if not match:
+    print(output)
+    raise Exception("SESSION_ID not found - login failed")
 
-    print("Status:", r.status_code)
-
-    if r.status_code != 204:
-        print("Headers:", r.headers)
-        print("Body:", r.text)
-        raise Exception(f"Login failed: {r.status_code}")
-
-    cookie = r.headers.get("Set-Cookie")
-    if not cookie or "SESSION_ID" not in cookie:
-        raise Exception("SESSION_ID not returned by server")
-
-    session_id = cookie.split("SESSION_ID=")[1].split(";")[0]
-    print("✅ SESSION_ID:", session_id)
-    return session_id
+SESSION_ID = match.group(1)
+print("✅ SESSION_ID:", SESSION_ID)
 
 
-def create_role(session_id):
-    print("📦 Creating role")
+print("📦 Creating role")
 
-    headers = {
-        "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",
-        "Cookie": f"SESSION_ID={session_id}"
-    }
+create_cmd = [
+    CURL, "-vk",
+    "-H", "Content-Type: application/vnd.safenetinc.lunasa+json;version=10",
+    "-H", f"Cookie: SESSION_ID={SESSION_ID}",
+    "-X", "POST",
+    "-d", f'{{"roleId":"{ROLE}","fullName":"{ROLE}"}}',
+    f"{BASE}/roles"
+]
 
-    payload = {
-        "roleId": ROLE_NAME,
-        "fullName": ROLE_NAME
-    }
-
-    r = requests.post(ROLES_URL, headers=headers, json=payload, verify=False)
-    print("Create Role Status:", r.status_code)
+print(run(create_cmd))
 
 
-def upload_resources(session_id):
-    print("📤 Uploading resources")
+print("📤 Uploading resources")
 
-    headers = {
-        "Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10",
-        "Cookie": f"SESSION_ID={session_id}"
-    }
+upload_cmd = [
+    CURL, "-vk", "-X", "PUT",
+    "-H", "Content-Type: application/vnd.safenetinc.lunasa+octet-stream;version=10",
+    "-H", f"Cookie: SESSION_ID={SESSION_ID}",
+    "--data-binary", f"@{RESOURCE_FILE}",
+    f"{BASE}/roles/{ROLE}/resources"
+]
 
-    with open(RESOURCE_FILE, "rb") as f:
-        r = requests.put(
-            f"{ROLES_URL}/{ROLE_NAME}/resources",
-            headers=headers,
-            data=f,
-            verify=False
-        )
-
-    print("Upload Status:", r.status_code)
+print(run(upload_cmd))
 
 
-def verify_role(session_id):
-    print("🔎 Verifying role")
+print("🔍 Verifying role")
 
-    headers = {
-        "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",
-        "Cookie": f"SESSION_ID={session_id}"
-    }
+verify_cmd = [
+    CURL, "-vk",
+    "-H", "Content-Type: application/vnd.safenetinc.lunasa+json;version=10",
+    "-H", f"Cookie: SESSION_ID={SESSION_ID}",
+    f"{BASE}/roles"
+]
 
-    r = requests.get(ROLES_URL, headers=headers, verify=False)
-    print(r.text)
-
-
-if __name__ == "__main__":
-    requests.packages.urllib3.disable_warnings()
-
-    sid = get_session_cookie()
-    create_role(sid)
-    upload_resources(sid)
-    verify_role(sid)
+print(run(verify_cmd))

@@ -22,8 +22,10 @@ import datetime
 import secrets
 import string
 import getpass
+import urllib3
 
-# paths
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
 PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
@@ -85,8 +87,9 @@ def create_session(base_url, username, password):
     print("[INFO] creating session...")
     s = requests.Session()
     s.auth = (username, password)
+    s.verify = False
 
-    r = s.post(f"{base_url}/auth/session", timeout=15)
+    r = s.post(f"{base_url}/auth/session", timeout=15, verify=False)
     if r.status_code not in (200, 201, 204):
         raise SystemExit(f"[ERROR] failed to establish session (status {r.status_code})")
 
@@ -121,7 +124,8 @@ def upload_role_resources(session, base_url):
             f"{base_url}/roles/{FIXED_ROLE_NAME}/resources",
             headers=headers,
             data=f.read(),
-            timeout=60
+            timeout=60,
+            verify=False
         )
 
     if r.status_code not in (200, 201, 204):
@@ -138,7 +142,7 @@ def create_user(session, base_url, username, password):
         "password": password
     }
 
-    r = session.post(f"{base_url}/users", json=payload, timeout=30)
+    r = session.post(f"{base_url}/users", json=payload, timeout=30, verify=False)
 
     if r.status_code not in (200, 201, 204):
         print(f"[ERROR] user creation failed for '{username}'")
@@ -155,7 +159,7 @@ def assign_role(session, base_url, username):
         "roleId": FIXED_ROLE_NAME
     }
 
-    r = session.post(f"{base_url}/users/{username}/roles", json=payload, timeout=30)
+    r = session.post(f"{base_url}/users/{username}/roles", json=payload, timeout=30, verify=False)
 
     if r.status_code not in (200, 201, 204):
         print(f"[ERROR] couldn't assign role to '{username}'")
@@ -166,7 +170,7 @@ def assign_role(session, base_url, username):
 
 
 def hsm_health_check(session, base_url):
-    r = session.get(f"{base_url}/api/lunasa", timeout=10)
+    r = session.get(f"{base_url}/api/lunasa", timeout=10, verify=False)
     if r.status_code == 200:
         print("[INFO] HSM reachable")
 
@@ -193,7 +197,7 @@ def main():
 
     h = load_hsm(args.hsm_id)
     host = h.get("ipAddress") or h.get("host")
-    base_url = f"https://{host}"
+    base_url = f"https://{host}:8443"
 
     session = create_session(base_url, args.apiuser, api_pw)
 

@@ -1,41 +1,50 @@
 #!/usr/bin/env python3
-"""
-Luna HSM User Management (REST)
-"""
 
-# install requests if missing
-try:
-    import requests
-except ImportError:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
+import sys
+import subprocess
 
-import argparse, json, os, getpass, secrets, string, re, datetime, sys
+def ensure_package(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
-# paths
+for package in ["requests", "urllib3"]:
+    ensure_package(package)
+
+import requests
+import json
+import urllib3
+import os
+import argparse
+import datetime
+import secrets
+import string
+import getpass
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BASE_URL = "https://10.24.128.64:8443"
+ROLE_ID = "usermanagementrole"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RES_DIR = os.path.join(BASE_DIR, "resources")
 
-HSM_FILE = os.path.join(RES_DIR, "hsm_mapping")
-VERSION_MAP_FILE = os.path.join(RES_DIR, "version_map")
-CUSTOM_ROLE_FILE = os.path.join(RES_DIR, "custom_role_resources")
+RESOURCE_FILE = os.path.join(RES_DIR, "usermanagement.txt")
 PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 
 os.makedirs(RES_DIR, exist_ok=True)
 
-
-def load_json(path):
-    if not os.path.exists(path):
-        raise SystemExit(f"[ERROR] Missing: {path}")
-    with open(path, "r") as f:
-        return json.load(f)
-
+ENV_USER_MAP = {
+    "DEV": "svc_at48994_usrmgt",
+    "TE1": "svc_at48993_usrmgt",
+    "TE2": "svc_at48992_usrmgt",
+    "PROD": "svc_at49008_usrmgt"
+}
 
 def gen_pw(n=16):
-    a = string.ascii_letters + string.digits + "._-"
-    return ''.join(secrets.choice(a) for _ in range(n))
-
+    chars = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(chars) for _ in range(n))
 
 def save_pw(user, pw):
     data = {}
@@ -44,155 +53,120 @@ def save_pw(user, pw):
             with open(PW_STORE, "r") as f:
                 data = json.load(f)
         except:
-            data = {}
+            pass
 
     data[user] = {
         "password": pw,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
 
-    tmp = PW_STORE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(PW_STORE, "w") as f:
         json.dump(data, f, indent=2)
-    os.replace(tmp, PW_STORE)
 
-    try:
-        os.chmod(PW_STORE, 0o600)
-    except:
-        pass
+# ---------------- CLI ----------------
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"])
+parser.add_argument("--apiuser", default="admin")
+parser.add_argument("--apipass")
+args = parser.parse_args()
 
-def pick_ct(version, vmap):
-    v = version.strip()
+ADMIN_USER = args.apiuser
+ADMIN_PASSWORD = args.apipass or getpass.getpass(f"Password for {ADMIN_USER}: ")
 
-    # exact match first
-    if v in vmap:
-        return f"application/vnd.safenetinc.lunasa+json;version={vmap[v]}"
+USER_ID = ENV_USER_MAP.get(args.env)
+if not USER_ID:
+    raise SystemExit("Invalid environment")
 
-    # match 7.x pattern
-    m = re.match(r"(\d+\.\d+\.\d+)", v)
-    if m:
-        mm = m.group(1)
-        if mm in vmap:
-            return f"application/vnd.safenetinc.lunasa+json;version={vmap[mm]}"
+HEADERS_JSON = {
+    "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"
+}
 
-    # match 7.x only
-    m2 = re.match(r"(\d+\.\d+)", v)
-    if m2:
-        mm = m2.group(1)
-        if mm in vmap:
-            return f"application/vnd.safenetinc.lunasa+json;version={vmap[mm]}"
+# ---------------- LOGIN ----------------
 
-    raise SystemExit(f"[ERROR] No REST API version mapping for firmware {v}")
+login_response = requests.post(
+    f"{BASE_URL}/auth/session",
+    headers=HEADERS_JSON,
+    auth=(ADMIN_USER, ADMIN_PASSWORD),
+    verify=False
+)
 
+session_id = login_response.cookies.get("SESSION_ID")
+if not session_id:
+    raise SystemExit("Login failed")
 
-def rest_login(sess, base, user, pw):
-    r = sess.post(f"{base}/auth/session", auth=(user, pw), timeout=20)
-    if r.status_code not in (200, 204):
-        raise SystemExit(f"[ERROR] Login failed: {r.status_code} {r.text}")
+SESSION_HEADERS_JSON = {
+    **HEADERS_JSON,
+    "Cookie": f"SESSION_ID={session_id}"
+}
 
-    cookies = sess.cookies.get_dict()
-    if cookies:
-        for k, v in cookies.items():
-            sess.headers.update({"Cookie": f"{k}={v}"})
+SESSION_HEADERS_STREAM = {
+    "Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10",
+    "Cookie": f"SESSION_ID={session_id}"
+}
 
-    print("[INFO] login ok.")
+# ---------------- CHECK IF USER EXISTS ----------------
 
+existing_users = requests.get(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
 
-def detect_fw(sess, base):
-    r = sess.get(f"{base}/api/lunasa", timeout=20)
-    r.raise_for_status()
-    fw = r.json().get("version", "").strip()
-    if not fw:
-        raise SystemExit("[ERROR] firmware not found")
-    print(f"[INFO] firmware: {fw}")
-    return fw
+if USER_ID in existing_users.text:
+    print(f"User '{USER_ID}' already exists. Skipping creation.")
+    sys.exit(0)
 
+# ---------------- PASSWORD GENERATION ----------------
 
-def create_role(sess, base, role_id, name, resources):
-    body = {
-        "roleId": role_id,
-        "fullName": name,
-        "resources": resources
-    }
-    r = sess.post(f"{base}/api/lunasa/roles", json=body, timeout=20)
-    if r.status_code not in (200, 201, 204):
-        raise SystemExit(f"[ERROR] role create failed: {r.status_code} {r.text}")
-    print(f"[INFO] role {role_id} created.")
+USER_PASSWORD = gen_pw()
+save_pw(USER_ID, USER_PASSWORD)
 
+# ---------------- ROLE CREATION ----------------
 
-def create_user(sess, base, uid, pw, role):
-    body = {
-        "userId": uid,
-        "password": pw,
-        "role": role
-    }
-    r = sess.post(f"{base}/api/lunasa/users", json=body, timeout=20)
-    if r.status_code not in (200, 201, 204):
-        raise SystemExit(f"[ERROR] user create failed: {r.status_code} {r.text}")
+requests.post(
+    f"{BASE_URL}/roles",
+    headers=SESSION_HEADERS_JSON,
+    data=json.dumps({"roleId": ROLE_ID, "fullName": ROLE_ID}),
+    verify=False
+)
 
-    print(f"[INFO] user {uid} created.")
-    return True
+roles_check = requests.get(
+    f"{BASE_URL}/roles",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
 
+if ROLE_ID not in roles_check.text:
+    raise SystemExit("Role creation failed")
 
-def main():
-    p = argparse.ArgumentParser(description="Luna HSM User Management (REST)")
-    p.add_argument("--hsm-id", required=True)
-    p.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"], type=str.upper)
-    p.add_argument("--apiuser", default="admin")
-    p.add_argument("--apipw")
-    p.add_argument("--newuser")
-    p.add_argument("--role-id", default="user_mgmt_role")
-    p.add_argument("--role-name", default="User Management Role")
-    a = p.parse_args()
+# ---------------- RESOURCE UPLOAD ----------------
 
-    # load resource files
-    hmap = load_json(HSM_FILE)
-    vmap = load_json(VERSION_MAP_FILE)
-    resources = load_json(CUSTOM_ROLE_FILE)
+if not os.path.exists(RESOURCE_FILE):
+    raise SystemExit(f"Missing role file: {RESOURCE_FILE}")
 
-    entry = next((h for h in hmap["hsms"] if h["id"] == a.hsm_id), None)
-    if not entry:
-        raise SystemExit("[ERROR] HSM id not found")
+with open(RESOURCE_FILE, "rb") as f:
+    requests.put(
+        f"{BASE_URL}/roles/{ROLE_ID}/resources",
+        headers=SESSION_HEADERS_STREAM,
+        data=f,
+        verify=False
+    )
 
-    host = entry.get("ipAddress") or entry.get("host")
-    port = int(entry.get("port", 8443))
-    base = f"https://{host}:{port}"
+# ---------------- USER CREATION ----------------
 
-    ENV_MAP = {
-        "DEV":  "svc_at48994_usrmgt",
-        "TE1":  "svc_at48993_usrmgt",
-        "TE2":  "svc_at48992_usrmgt",
-        "PROD": "svc_at49008_usrmgt"
-    }
+user_payload = {
+    "userId": USER_ID,
+    "role": ROLE_ID,
+    "password": USER_PASSWORD
+}
 
-    new_user = a.newuser or ENV_MAP[a.env]
+requests.post(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    data=json.dumps(user_payload),
+    verify=False
+)
 
-    admin_pw = a.apipw or getpass.getpass(f"Password for {a.apiuser}@HSM: ")
-    new_user_pw = gen_pw()
-
-    sess = requests.Session()
-    sess.verify = False
-    sess.headers.clear()
-
-    print(f"[INFO] connecting to {host}:{port} ...")
-    rest_login(sess, base, a.apiuser, admin_pw)
-
-    fw = detect_fw(sess, base)
-    ct = pick_ct(fw, vmap)
-    sess.headers.update({"Content-Type": ct})
-
-    print(f"[INFO] CT: {ct}")
-    print(f"[INFO] resources loaded: {len(resources)}")
-
-    create_role(sess, base, a.role_id, a.role_name, resources)
-
-    ok = create_user(sess, base, new_user, new_user_pw, a.role_id)
-    if ok:
-        save_pw(new_user, new_user_pw)
-
-    print("\n[COMPLETE]\n")
-
-
-if __name__ == "__main__":
-    main()
+print("Role and user created successfully.")
+print(f"User: {USER_ID}")

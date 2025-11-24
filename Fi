@@ -4,7 +4,6 @@ try:
     import requests
 except ImportError:
     import subprocess, sys
-    print("[INFO] installing requests...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
@@ -16,10 +15,6 @@ import secrets
 import string
 import getpass
 import re
-import base64
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 RES_DIR = "resources"
 HSM_FILE = os.path.join(RES_DIR, "hsm_mapping.json")
@@ -66,153 +61,129 @@ def save_pw(user, pw):
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, PW_STORE)
-    try:
-        os.chmod(PW_STORE, 0o600)
-    except:
-        pass
 
 
-def detect_api_version(base_url):
-    r = requests.get(f"{base_url}/api/lunasa", verify=False)
-    text = r.text.lower()
-    m = re.search(r"(\d+)", text)
+def detect_version(base_url, session):
+    r = session.get(base_url + "/", verify=False)
+    ct = r.headers.get("Content-Type", "")
+    m = re.search(r"version=(\d+)", ct)
     return m.group(1) if m else "10"
 
 
-def create_session(base_url, username, password, api_version):
-    token = base64.b64encode(f"{username}:{password}".encode()).decode()
-
+def create_session(base_url, session, user, password, version):
     headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "Authorization": f"Basic {token}"
+        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={version}"
     }
-
-    r = requests.post(
-        f"{base_url}/auth/session",
+    r = session.post(
+        base_url + "/auth/session",
         headers=headers,
+        auth=(user, password),
         verify=False
     )
-
-    if r.status_code not in (200, 204):
-        raise SystemExit(f"[ERROR] failed to establish session (status {r.status_code})")
-
-    return r.cookies.get("SESSION_ID")
+    return r.status_code == 204
 
 
-def ensure_role_exists(base_url, session_id, api_version):
+def create_role(base_url, session, version):
     headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "Cookie": f"SESSION_ID={session_id}"
+        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={version}"
     }
-
-    payload = {"roleId": FIXED_ROLE_NAME, "fullName": FIXED_ROLE_NAME}
-
-    requests.post(
-        f"{base_url}/roles",
-        headers=headers,
-        json=payload,
-        verify=False
-    )
+    payload = {
+        "roleId": FIXED_ROLE_NAME,
+        "fullName": FIXED_ROLE_NAME
+    }
+    session.post(base_url + "/roles", headers=headers, json=payload, verify=False)
 
 
-def upload_role_resources(base_url, session_id, api_version):
+def upload_role_resources(base_url, session, version):
     if not os.path.exists(ROLE_RES_FILE):
         raise SystemExit(f"[ERROR] missing role resource file: {ROLE_RES_FILE}")
 
     with open(ROLE_RES_FILE, "rb") as f:
-        data = f.read()
+        raw = f.read()
 
     headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+octet-stream;version={api_version}",
-        "Cookie": f"SESSION_ID={session_id}"
+        "Content-Type": f"application/vnd.safenetinc.lunasa+octet-stream;version={version}"
     }
 
-    r = requests.put(
+    session.put(
         f"{base_url}/roles/{FIXED_ROLE_NAME}/resources",
         headers=headers,
-        data=data,
+        data=raw,
         verify=False
     )
 
-    if r.status_code not in (200, 204):
-        raise SystemExit("[ERROR] failed to upload role resources")
 
-
-def create_user(base_url, session_id, api_version, username, password):
+def create_user(base_url, session, version, username):
     headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "Cookie": f"SESSION_ID={session_id}"
+        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={version}"
     }
+    pw = gen_pw()
+    payload = {
+        "userId": username,
+        "password": pw
+    }
+    r = session.post(base_url + "/api/lunasa/users", headers=headers, json=payload, verify=False)
+    if r.status_code not in (200, 201, 204):
+        return None
+    save_pw(username, pw)
+    return pw
 
-    payload = {"username": username, "password": password}
 
-    r = requests.post(
-        f"{base_url}/users",
+def assign_role(base_url, session, version, username):
+    headers = {
+        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={version}"
+    }
+    payload = {"roleId": FIXED_ROLE_NAME}
+    session.post(
+        f"{base_url}/api/lunasa/users/{username}/roles",
         headers=headers,
         json=payload,
         verify=False
     )
-
-    if r.status_code not in (200, 201, 204):
-        raise SystemExit(f"[ERROR] user creation failed for '{username}'")
-
-    save_pw(username, password)
-
-
-def assign_role(base_url, session_id, api_version, username):
-    headers = {
-        "Content-Type": f"application/vnd.safenetinc.lunasa+json;version={api_version}",
-        "Cookie": f"SESSION_ID={session_id}"
-    }
-
-    payload = {"username": username, "roleId": FIXED_ROLE_NAME}
-
-    r = requests.post(
-        f"{base_url}/users/{username}/roles",
-        headers=headers,
-        json=payload,
-        verify=False
-    )
-
-    if r.status_code not in (200, 201, 204):
-        raise SystemExit(f"[ERROR] couldn't assign role to '{username}'")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Luna HSM User Management (REST)")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--hsm-id", required=True)
-    parser.add_argument("--env", required=True, choices=["DEV","TE1","TE2","PROD"], type=str.upper)
-    parser.add_argument("--apiuser", default="admin")
-    parser.add_argument("--apipassword")
+    parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"], type=str.upper)
+    parser.add_argument("--sshuser", default="admin")
+    parser.add_argument("--sshpassword")
     parser.add_argument("--newuser")
     args = parser.parse_args()
 
-    if args.newuser:
-        new_user = args.newuser
-        print(f"[INFO] using provided user: {new_user}")
-    else:
-        new_user = ENV_USER_MAP.get(args.env)
-        if not new_user:
-            raise SystemExit(f"[ERROR] invalid env '{args.env}'")
-        print(f"[INFO] env {args.env}: user {new_user}")
+    env = args.env
+    new_user = args.newuser or ENV_USER_MAP.get(env)
+    if not new_user:
+        raise SystemExit("[ERROR] invalid env")
 
-    api_pw = args.apipassword or getpass.getpass(f"Password for {args.apiuser}@HSM: ")
+    print(f"[INFO] env {env}: user {new_user}")
+
+    admin_user = args.sshuser
+    admin_pw = args.sshpassword or getpass.getpass(f"Password for {admin_user}@HSM: ")
 
     h = load_hsm(args.hsm_id)
     host = h.get("ipAddress") or h.get("host")
     base_url = f"https://{host}:8443"
 
-    api_version = detect_api_version(base_url)
-    session_id = create_session(base_url, args.apiuser, api_pw, api_version)
+    session = requests.Session()
 
-    ensure_role_exists(base_url, session_id, api_version)
-    upload_role_resources(base_url, session_id, api_version)
+    version = detect_version(base_url, session)
 
-    user_pw = gen_pw()
-    create_user(base_url, session_id, api_version, new_user, user_pw)
-    assign_role(base_url, session_id, api_version, new_user)
+    if not create_session(base_url, session, admin_user, admin_pw, version):
+        print("[ERROR] failed to establish session")
+        return
 
-    print(f"[INFO] complete for HSM {args.hsm_id} ({args.env})")
+    create_role(base_url, session, version)
+    upload_role_resources(base_url, session, version)
+
+    pw = create_user(base_url, session, version, new_user)
+    if not pw:
+        print("[ERROR] user creation failed")
+        return
+
+    assign_role(base_url, session, version, new_user)
+
+    print(f"[INFO] complete for HSM {args.hsm_id} ({env})")
 
 
 if __name__ == "__main__":

@@ -1,72 +1,134 @@
 import requests
 import json
 import urllib3
+import os
+import argparse
+import datetime
+import secrets
+import string
 
-# Disable SSL warnings because we are not using cert (-k in curl)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://10.24.128.64:8443"
-USERNAME = "admin"
-PASSWORD = "q......"   # <-- put your real password here
+ADMIN_USER = "admin"
+ADMIN_PASSWORD = "q......"
 
-HEADERS = {
+ROLE_ID = "usermanagementrole"
+RESOURCE_FILE = "resources/usermanagement.txt"
+PW_STORE = "resources/user_passwords.json"
+
+os.makedirs("resources", exist_ok=True)
+
+ENV_USER_MAP = {
+    "DEV": "svc_at48994_usrmgt",
+    "TE1": "svc_at48993_usrmgt",
+    "TE2": "svc_at48992_usrmgt",
+    "PROD": "svc_at49008_usrmgt"
+}
+
+def gen_pw(n=16):
+    chars = string.ascii_letters + string.digits + "._-"
+    return ''.join(secrets.choice(chars) for _ in range(n))
+
+def save_pw(user, pw):
+    data = {}
+    if os.path.exists(PW_STORE):
+        try:
+            with open(PW_STORE, "r") as f:
+                data = json.load(f)
+        except:
+            pass
+
+    data[user] = {
+        "password": pw,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z"
+    }
+
+    with open(PW_STORE, "w") as f:
+        json.dump(data, f, indent=2)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--env", required=True, choices=["DEV", "TE1", "TE2", "PROD"])
+args = parser.parse_args()
+
+USER_ID = ENV_USER_MAP.get(args.env)
+if not USER_ID:
+    raise SystemExit("Invalid environment")
+
+USER_PASSWORD = gen_pw()
+save_pw(USER_ID, USER_PASSWORD)
+
+HEADERS_JSON = {
     "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10"
 }
 
-# ---------------------------
-# 1. LOGIN -> GET SESSION_ID
-# ---------------------------
-login_url = f"{BASE_URL}/auth/session"
-
 login_response = requests.post(
-    login_url,
-    headers=HEADERS,
-    auth=(USERNAME, PASSWORD),
+    f"{BASE_URL}/auth/session",
+    headers=HEADERS_JSON,
+    auth=(ADMIN_USER, ADMIN_PASSWORD),
     verify=False
 )
 
-# Extract SESSION_ID from cookies
 session_id = login_response.cookies.get("SESSION_ID")
-
 if not session_id:
-    raise Exception("SESSION_ID not received. Login failed.")
+    raise SystemExit("Login failed")
 
-print("SESSION_ID:", session_id)
-
-# Common headers with session cookie
-session_headers = {
-    "Content-Type": "application/vnd.safenetinc.lunasa+json;version=10",
+SESSION_HEADERS_JSON = {
+    **HEADERS_JSON,
     "Cookie": f"SESSION_ID={session_id}"
 }
 
-# ---------------------------
-# 2. GET ROLES
-# ---------------------------
-roles_url = f"{BASE_URL}/roles"
-
-get_roles_response = requests.get(
-    roles_url,
-    headers=session_headers,
-    verify=False
-)
-
-print("GET Roles Status:", get_roles_response.status_code)
-print(get_roles_response.text)
-
-# ---------------------------
-# 3. CREATE ROLE
-# ---------------------------
-create_role_payload = {
-    "roleId": "michisrole",
-    "fullName": "michisrole"
+SESSION_HEADERS_STREAM = {
+    "Content-Type": "application/vnd.safenetinc.lunasa+octet-stream;version=10",
+    "Cookie": f"SESSION_ID={session_id}"
 }
 
-create_role_response = requests.post(
-    roles_url,
-    headers=session_headers,
-    data=json.dumps(create_role_payload),
+requests.post(
+    f"{BASE_URL}/roles",
+    headers=SESSION_HEADERS_JSON,
+    data=json.dumps({"roleId": ROLE_ID, "fullName": ROLE_ID}),
     verify=False
 )
 
-print("Create Role Status:", create_role_response.status_code)
-print(create_role_response.text)
+roles_check = requests.get(
+    f"{BASE_URL}/roles",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
+
+if ROLE_ID not in roles_check.text:
+    raise SystemExit("Role creation failed")
+
+with open(RESOURCE_FILE, "rb") as f:
+    requests.put(
+        f"{BASE_URL}/roles/{ROLE_ID}/resources",
+        headers=SESSION_HEADERS_STREAM,
+        data=f,
+        verify=False
+    )
+
+user_payload = {
+    "userId": USER_ID,
+    "role": ROLE_ID,
+    "password": USER_PASSWORD
+}
+
+requests.post(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    data=json.dumps(user_payload),
+    verify=False
+)
+
+users_check = requests.get(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
+
+if USER_ID not in users_check.text:
+    raise SystemExit("User creation failed")
+
+print("Role and user created successfully.")
+print(f"User: {USER_ID}")
+print("Password stored in resources/user_passwords.json")

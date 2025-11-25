@@ -21,7 +21,6 @@ import datetime
 import secrets
 import string
 import getpass
-import re
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -36,6 +35,13 @@ RESOURCE_FILE = os.path.join(RES_DIR, "usermanagement.txt")
 PW_STORE = os.path.join(RES_DIR, "user_passwords.json")
 
 os.makedirs(RES_DIR, exist_ok=True)
+
+ENV_USER_MAP = {
+    "DEV": "svc_at48994_usrmgt",
+    "TE1": "svc_at48993_usrmgt",
+    "TE2": "svc_at48992_usrmgt",
+    "PROD": "svc_at49008_usrmgt"
+}
 
 def gen_pw(n=16):
     chars = string.ascii_letters + string.digits + "._-"
@@ -62,8 +68,10 @@ def infer_env_from_id(hsm_id):
     lid = hsm_id.lower()
     if "dev" in lid:
         return "DEV"
-    if "eng" in lid:
-        return "ENG"
+    if "te1" in lid:
+        return "TE1"
+    if "te2" in lid:
+        return "TE2"
     if "prod" in lid:
         return "PROD"
     return None
@@ -79,7 +87,7 @@ def load_json(path):
 parser = argparse.ArgumentParser()
 parser.add_argument("--hsm-id", required=True)
 parser.add_argument("--env")
-parser.add_argument("--apiuser")
+parser.add_argument("--apiuser", default="admin")
 parser.add_argument("--apipass")
 args = parser.parse_args()
 
@@ -99,9 +107,16 @@ if not hsm_entry:
 
 HSM_IP = hsm_entry.get("ipAddress")
 FW_VERSION = hsm_entry.get("fwVersion")
-DEFAULT_USER = hsm_entry.get("username")
 
 ENV = args.env or infer_env_from_id(args.hsm_id)
+
+if not ENV:
+    raise SystemExit("Environment could not be determined. Please supply --env")
+
+if ENV not in ENV_USER_MAP:
+    raise SystemExit(f"No user mapping found for environment: {ENV}")
+
+TARGET_USER = ENV_USER_MAP[ENV]
 
 API_VERSION = version_map.get(FW_VERSION)
 if not API_VERSION:
@@ -109,7 +124,7 @@ if not API_VERSION:
 
 BASE_URL = f"https://{HSM_IP}:8443"
 
-ADMIN_USER = args.apiuser or DEFAULT_USER or "admin"
+ADMIN_USER = args.apiuser
 ADMIN_PASSWORD = args.apipass or getpass.getpass(f"Password for {ADMIN_USER}: ")
 
 HEADERS_JSON = {
@@ -136,11 +151,14 @@ if not session_id:
 SESSION_HEADERS_JSON = { **HEADERS_JSON, "Cookie": f"SESSION_ID={session_id}" }
 SESSION_HEADERS_STREAM = { **HEADERS_STREAM, "Cookie": f"SESSION_ID={session_id}" }
 
-# ---------------- CHECK EXISTING USERS ----------------
+# ---------------- CHECK IF USER EXISTS ----------------
 
-users_resp = requests.get(f"{BASE_URL}/users", headers=SESSION_HEADERS_JSON, verify=False)
+users_resp = requests.get(
+    f"{BASE_URL}/users",
+    headers=SESSION_HEADERS_JSON,
+    verify=False
+)
 
-TARGET_USER = DEFAULT_USER
 if TARGET_USER in users_resp.text:
     print(f"User '{TARGET_USER}' already exists. Skipping creation.")
     sys.exit(0)

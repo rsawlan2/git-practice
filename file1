@@ -19,3 +19,35 @@ def _generate_temp_password(length=12):
     pw += [secrets.choice(all_chars) for _ in range(length - 4)]
     secrets.SystemRandom().shuffle(pw)
     return "".join(pw)
+def create_user(client, username):
+    temp_pw = _generate_temp_password()
+
+    out, err, rc = ssh_run(
+        client,
+        f"user add -username {username}",
+        timeout=60,
+        input_text=f"{temp_pw}\n{temp_pw}\n"
+    )
+
+    combo = (out + err).lower()
+
+    # If user exists, force password reset instead of failing
+    if "already exists" in combo or rc != 0:
+        print(f"[INFO] User {username} exists. Resetting password instead...")
+
+        out, err, rc = ssh_run(
+            client,
+            f"user password {username}",
+            timeout=60,
+            input_text=f"{temp_pw}\n{temp_pw}\n"
+        )
+
+        if rc != 0 or "error" in (out + err).lower():
+            print(f"[ERROR] Password reset failed for {username}")
+            return None
+
+    _save_password_for_user(username, temp_pw)
+
+    print(f"[INFO] Password updated for user '{username}'.")
+    print(f"[INFO] Saved in {PW_STORE}")
+    return temp_pw

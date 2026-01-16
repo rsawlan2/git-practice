@@ -1,0 +1,276 @@
+# Luna HSM User Management Scripts
+
+## Overview
+
+This repository contains two Python scripts used to manage service users on a Luna Hardware Security Module (HSM).  
+Both scripts automate the creation of a user, the creation or validation of a role, and the assignment of that role to the user.
+
+The scripts differ only in the interface used to communicate with the HSM:
+
+- um_lunash.py uses SSH and LunaSH (command-line interface)
+- um_rest_api.py uses the Luna REST API over HTTPS
+
+From a functional point of view, both scripts achieve the same end result.
+
+---
+
+## Scripts Included
+
+1. um_lunash.py  
+   Uses SSH to log in to the HSM and execute LunaSH commands.
+
+2. um_rest_api.py  
+   Uses REST APIs exposed by the HSM to perform the same operations programmatically.
+
+Both scripts are intended for controlled internal environments and assume administrative access to the HSM.
+
+---
+
+## Repository Structure
+
+.
+├── um_lunash.py
+├── um_rest_api.py
+└── resources/
+    ├── hsm_mapping.json
+    ├── user_passwords.json        (auto-created)
+    ├── version_map.json           (REST only)
+    └── usermanagement.txt         (REST only)
+
+The resources directory is mandatory for correct execution of the scripts.
+
+---
+
+## Common Prerequisites
+
+Before running either script, ensure the following:
+
+- Python 3 is installed on the execution host
+- Network connectivity to the target HSM exists
+- Administrative credentials for the HSM are available
+- The user running the script has read/write access to the resources directory
+
+Both scripts install required Python packages automatically if they are missing.
+
+---
+
+## Common Behaviour Across Both Scripts
+
+Both scripts perform the following high-level steps:
+
+- Load HSM connection details from resources/hsm_mapping.json
+- Identify the target environment (DEV, TE1, TE2, or PROD)
+- Resolve the service username based on the environment
+- Ensure a role with required permissions exists
+- Create a user on the HSM
+- Assign the role to the user
+- Generate a password automatically
+- Store generated credentials locally for reference
+
+No passwords are printed to the console.
+
+---
+
+## Environment to User Mapping
+
+Each environment maps to a fixed service user.  
+This mapping is consistent across both scripts.
+
+DEV   → svc_at4894_usrmgt  
+TE1   → svc_at48993_usrmgt  
+TE2   → svc_at48992_usrmgt  
+PROD  → svc_at49008_usrmgt  
+
+The SSH-based script allows overriding this mapping.  
+The REST-based script does not.
+
+---
+
+## Password Storage
+
+Generated passwords are stored locally in:
+
+resources/user_passwords.json
+
+For each user, the file stores:
+- Username
+- Generated password
+- Timestamp of creation (UTC)
+
+The file is created automatically if it does not exist.  
+This file must not be committed to source control.
+
+---
+
+## SSH-Based Script (um_lunash.py)
+
+### Description
+
+The SSH-based script manages users by logging into the HSM using SSH and executing LunaSH commands.
+It dynamically detects the firmware version running on the HSM and selects the appropriate role definition.
+
+This script is designed to be safe to re-run.
+
+---
+
+### Usage
+
+python um_lunash.py --hsm-id <HSM_ID> --env <ENV>
+
+Example:
+
+python um_lunash.py --hsm-id HSM01 --env DEV
+
+---
+
+### Supported Arguments
+
+--hsm-id  
+Required. Identifies the HSM entry in hsm_mapping.json.
+
+--env  
+Required. Specifies the environment (DEV, TE1, TE2, PROD).
+
+--sshuser  
+Optional. SSH username. Defaults to admin.
+
+--sshpassword  
+Optional. SSH password. If omitted, the script prompts for it.
+
+--newuser  
+Optional. Overrides the default service username derived from the environment.
+
+---
+
+### Execution Flow (SSH Script)
+
+1. Parse command-line arguments
+2. Resolve the target username using environment mapping or override
+3. Load HSM connection details from the mapping file
+4. Establish an SSH connection to the HSM
+5. Execute firmware version commands via LunaSH
+6. Parse the firmware output to determine the version group
+7. Select the appropriate role definition
+8. Generate a role file locally
+9. Upload the role file to the HSM using SCP
+10. Import the role into the HSM
+11. Create the user on the HSM
+12. If the user already exists:
+    - Reset the password instead of failing
+13. Assign the role to the user
+14. Remove temporary role files from the local system
+15. Print a summary of execution
+
+---
+
+### SSH Script Behaviour Notes
+
+- Firmware detection is best-effort
+- If firmware detection fails, a fallback role is used
+- Existing users have their passwords reset
+- The script is idempotent and safe to re-run
+- SSH key-based authentication is intentionally disabled
+
+---
+
+## REST API–Based Script (um_rest_api.py)
+
+### Description
+
+The REST-based script manages users using the Luna REST APIs over HTTPS.
+It relies on predefined firmware-to-API version mappings and uses static role definitions.
+
+This script is conservative by design and does not modify existing users.
+
+---
+
+### Usage
+
+python um_rest_api.py --hsm-id <HSM_ID> --env <ENV>
+
+Example:
+
+python um_rest_api.py --hsm-id HSM01 --env DEV
+
+If --env is omitted, the environment is inferred from the HSM ID.
+
+---
+
+### Supported Arguments
+
+--hsm-id  
+Required. Identifies the HSM entry in hsm_mapping.json.
+
+--env  
+Optional. Environment name.
+
+--apiuser  
+Optional. REST API admin username. Defaults to admin.
+
+--apipass  
+Optional. REST API password. If omitted, the script prompts for it.
+
+---
+
+### Execution Flow (REST Script)
+
+1. Ensure required Python packages are installed
+2. Load HSM mapping and firmware version
+3. Load firmware-to-API mappings from version_map.json
+4. Resolve environment and service username
+5. Authenticate using the REST session endpoint
+6. Establish a session using cookies
+7. Check whether the target user already exists
+8. If the user exists:
+   - Exit without making changes
+9. Create the role using REST API calls
+10. Upload role permissions from usermanagement.txt
+11. Generate a password
+12. Create the user and assign the role
+13. Store credentials locally
+14. Print a completion message
+
+---
+
+### REST Script Behaviour Notes
+
+- Uses HTTPS on port 8443
+- SSL certificate verification is disabled
+- Role permissions are sourced from a static file
+- Existing users are not modified
+- No fallback behaviour exists for missing firmware mappings
+
+---
+
+## Key Differences Between the Scripts
+
+SSH-based script:
+- Uses SSH and LunaSH
+- Detects firmware dynamically
+- Resets password if user exists
+- Fully idempotent
+
+REST-based script:
+- Uses REST APIs
+- Uses firmware-to-API mapping file
+- Exits if user already exists
+- Non-destructive
+
+---
+
+## Entry Points
+
+um_lunash.py  
+Execution starts from the main() function.
+
+um_rest_api.py  
+Execution starts after argument parsing in the script body.
+
+---
+
+## Notes
+
+- These scripts do not delete users or roles
+- No rollback logic is implemented
+- Scripts are intended for controlled internal usage only
+- All changes are explicit and logged to the console

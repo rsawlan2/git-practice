@@ -1,0 +1,66 @@
+Behavioural Comparison and Script Usage
+
+Although both scripts perform the same functional task, their behaviour differs in important ways.
+This section explains both the behavioural differences and how each script is executed in practice.
+
+SSH Script – Behaviour and Usage (um_lunash.py)
+
+The SSH-based script interacts with the HSM using LunaSH commands over an SSH session.
+It behaves in the same way a human operator would by logging into the HSM and executing administrative commands.
+
+Behaviour
+
+When executed, the script:
+- connects to the HSM using SSH,
+- detects the firmware version dynamically,
+- generates a role definition at runtime,
+- uploads and imports the role,
+- creates the user,
+- and if the user already exists, resets the password instead of failing.
+
+This makes the SSH script suitable for both initial provisioning and ongoing operational tasks such as password rotation.
+The script is safe to re-run multiple times.
+
+Usage
+
+Basic execution:
+python um_lunash.py --hsm-id HSM01 --env DEV
+
+Optional parameters:
+python um_lunash.py --hsm-id HSM01 --env DEV --sshuser admin --sshpassword ***** --newuser custom_user
+
+
+REST Script – Behaviour and Usage (um_rest_api.py)
+
+The REST-based script interacts with the HSM using HTTPS REST APIs.
+All operations are performed using API calls and validated responses.
+
+Behaviour
+
+When executed, the script:
+- authenticates using the REST session endpoint,
+- determines the correct API version from configuration,
+- checks if the user already exists,
+- creates a role using a static definition,
+- creates the user,
+- and stores generated credentials locally.
+
+If the user already exists, the script exits without making any changes.
+The REST script never resets passwords and never modifies existing users.
+
+Usage
+
+Basic execution:
+python um_rest_api.py --hsm-id HSM01 --env DEV
+
+Without environment:
+python um_rest_api.py --hsm-id HSM01
+
+Optional parameters:
+python um_rest_api.py --hsm-id HSM01 --env DEV --apiuser admin --apipass *****
+
+
+Practical Summary
+
+The SSH script can be used for both provisioning and maintenance and is safe to re-run.
+The REST script is used only for initial provisioning and exits if the user already exists.
